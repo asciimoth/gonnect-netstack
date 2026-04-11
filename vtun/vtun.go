@@ -38,6 +38,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // TODO: Use complete DNS resolver instead of adhoc one
@@ -72,6 +74,11 @@ type Opts struct {
 
 	// Name specifies the name of the tunnel interface. Default: "vtun".
 	Name string
+
+	// NoLoopbackAddr prevents adding loopback addresses (127.0.0.1 and ::1) to the
+	// local addresses. This is useful when using the spoofer to prevent "martian
+	// packet" errors when the stack chooses a loopback address as the source.
+	NoLoopbackAddr bool
 
 	// NetStackOpts provides additional netstack configuration options.
 	NetStackOpts *helpers.Opts
@@ -108,8 +115,8 @@ func (o *Opts) laddrs() []netip.Addr {
 	loopback4 := netip.MustParseAddr("127.0.0.1")
 	loopback6 := netip.MustParseAddr("::1")
 	if o != nil && len(o.LocalAddrs) > 0 {
-		addlb4 := true
-		addlb6 := true
+		addlb4 := !o.NoLoopbackAddr
+		addlb6 := !o.NoLoopbackAddr
 		laddrs := make([]netip.Addr, 0, len(o.LocalAddrs)+1)
 		for _, addr := range o.LocalAddrs {
 			laddrs = append(laddrs, addr)
@@ -134,8 +141,10 @@ func (o *Opts) laddrs() []netip.Addr {
 	if ip6 := o.opts().GetIPAlloc().Alloc6(); ip6 != nil && ip6.To16() != nil {
 		laddrs = append(laddrs, netip.AddrFrom16([16]byte(ip6.To16())))
 	}
-	laddrs = append(laddrs, loopback4)
-	laddrs = append(laddrs, loopback6)
+	if !o.NoLoopbackAddr {
+		laddrs = append(laddrs, loopback4)
+		laddrs = append(laddrs, loopback6)
+	}
 	return laddrs
 }
 
@@ -166,7 +175,7 @@ func (o *Opts) opts() *helpers.Opts {
 // Returns the initialized VTun instance or an error.
 func (o *Opts) Build() (*VTun, error) {
 	no := o.opts()
-	st, err := no.BuildStack()
+	st, err := no.BuildStack(true)
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +332,32 @@ func (vt *VTun) GetDnsServers() []netip.Addr {
 	return vt.dnsServers
 }
 
+// dialAddr returns the first non-loopback address for the given IP version,
+// falling back to unspecified if none found. Used for outgoing connections
+// to prevent "martian packet" errors when loopback addresses are configured.
+func (vt *VTun) dialAddr(isV6 bool) netip.Addr {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	for _, addr := range vt.localAddrs {
+		if addr.IsLoopback() {
+			continue
+		}
+		if isV6 && addr.Is6() {
+			return addr
+		}
+		if !isV6 && addr.Is4() {
+			return addr
+		}
+	}
+
+	// Fallback to unspecified if no non-loopback address found
+	if isV6 {
+		return netip.IPv6Unspecified()
+	}
+	return netip.IPv4Unspecified()
+}
+
 // SetDnsServers configures the DNS servers to use for name resolution.
 func (vt *VTun) SetDnsServers(servers []netip.Addr) {
 	vt.lookupMu.Lock()
@@ -442,7 +477,36 @@ func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gone
 		return nil, err
 	}
 	fa, pn := helpers.ConvertToFullAddr(addr)
-	return gonet.DialContextTCP(ctx, vt.stack, fa, pn)
+
+	var wq waiter.Queue
+	ep, tcpipErr := vt.stack.NewEndpoint(tcp.ProtocolNumber, pn, &wq)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("tcp endpoint: %s", tcpipErr)
+	}
+
+	// Bind to a non-loopback address to prevent martian packet errors
+	localAddr := vt.dialAddr(addr.Addr().Is6())
+	bindFA := tcpip.FullAddress{
+		Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
+		Port: 0,
+		NIC:  vt.nid,
+	}
+	if tcpipErr = ep.Bind(bindFA); tcpipErr != nil {
+		ep.Close()
+		return nil, fmt.Errorf("tcp bind: %s", tcpipErr)
+	}
+
+	// Connect to remote address
+	tcpipErr = ep.Connect(fa)
+	if tcpipErr != nil {
+		// ErrConnectStarted is expected for non-blocking TCP connect
+		if _, ok := tcpipErr.(*tcpip.ErrConnectStarted); !ok {
+			ep.Close()
+			return nil, fmt.Errorf("tcp connect: %s", tcpipErr)
+		}
+	}
+
+	return gonet.NewTCPConn(&wq, ep), nil
 }
 
 func (vt *VTun) dialTCP(
@@ -596,11 +660,27 @@ func (vt *VTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (*gonet.UDPConn, er
 	}
 	var lfa, rfa *tcpip.FullAddress
 	var pn tcpip.NetworkProtocolNumber
+
+	// If no local address specified, use non-loopback address to prevent martian packets
 	if laddr.IsValid() || laddr.Port() > 0 {
 		var addr tcpip.FullAddress
 		addr, pn = helpers.ConvertToFullAddr(laddr)
 		lfa = &addr
+	} else {
+		// Auto-select a non-loopback address
+		isV6 := raddr.Addr().Is6()
+		localAddr := vt.dialAddr(isV6)
+		pn = ipv4.ProtocolNumber
+		if isV6 {
+			pn = ipv6.ProtocolNumber
+		}
+		lfa = &tcpip.FullAddress{
+			Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
+			Port: 0,
+			NIC:  vt.nid,
+		}
 	}
+
 	if raddr.IsValid() || raddr.Port() > 0 {
 		var addr tcpip.FullAddress
 		addr, pn = helpers.ConvertToFullAddr(raddr)
@@ -902,6 +982,10 @@ func (vt *VTun) exchangeDNS(ctx context.Context, server netip.Addr, q dnsmessage
 		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
 	}
 
+	// Use a non-loopback source address to prevent "martian packet" errors
+	isV6 := server.Is6()
+	localAddr := vt.dialAddr(isV6)
+
 	for _, useUDP := range []bool{true, false} {
 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
 		defer cancel()
@@ -910,7 +994,7 @@ func (vt *VTun) exchangeDNS(ctx context.Context, server netip.Addr, q dnsmessage
 		// TODO: Close c on ctx cancellation
 		var err error
 		if useUDP {
-			c, err = vt.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(server, 53))
+			c, err = vt.DialUDPAddrPort(netip.AddrPortFrom(localAddr, 0), netip.AddrPortFrom(server, 53))
 		} else {
 			c, err = vt.DialTCPAddrPort(ctx, netip.AddrPortFrom(server, 53))
 		}

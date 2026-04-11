@@ -53,9 +53,9 @@ func (o *Opts) sack() bool {
 // BuildStack creates and configures a new gVisor network stack with IPv4, IPv6,
 // TCP, UDP, and ICMP protocols enabled. It applies the configured options for
 // TCP SACK and returns the initialized stack.
-func (o *Opts) BuildStack() (*stack.Stack, error) {
+func (o *Opts) BuildStack(local bool) (*stack.Stack, error) {
 	st := stack.New(stack.Options{
-		HandleLocal: true,
+		HandleLocal: local,
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
 			ipv6.NewProtocol,
