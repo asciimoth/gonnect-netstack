@@ -1,4 +1,4 @@
-module github.com/asciimoth/gonnectnetstack
+module github.com/asciimoth/gonnect-netstack
 
 go 1.25.5
 

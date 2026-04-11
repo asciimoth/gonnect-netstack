@@ -24,10 +24,10 @@ import (
 	"github.com/asciimoth/gonnect"
 	"golang.org/x/net/dns/dnsmessage"
 
+	"github.com/asciimoth/gonnect-netstack/helpers"
 	ge "github.com/asciimoth/gonnect/errors"
 	gh "github.com/asciimoth/gonnect/helpers"
 	"github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/gonnectnetstack/helpers"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"

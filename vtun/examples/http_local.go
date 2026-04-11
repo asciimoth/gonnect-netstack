@@ -10,7 +10,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/asciimoth/gonnectnetstack/vtun"
+	"github.com/asciimoth/gonnect-netstack/vtun"
 )
 
 func main() {

@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	gt "github.com/asciimoth/gonnect/testing"
 	"github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/gonnectnetstack/vtun"
 )
 
 // setupVTunPair creates two connected VTun instances for testing.

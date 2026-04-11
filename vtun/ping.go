@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/asciimoth/gonnectnetstack/helpers"
+	"github.com/asciimoth/gonnect-netstack/helpers"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )

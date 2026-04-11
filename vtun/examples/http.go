@@ -11,8 +11,8 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	"github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/gonnectnetstack/vtun"
 )
 
 func main() {

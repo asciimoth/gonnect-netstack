@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
+	"github.com/asciimoth/gonnect-netstack/helpers"
 	"github.com/asciimoth/gonnect/tun"
-	"github.com/asciimoth/gonnectnetstack/helpers"
 	"golang.org/x/time/rate"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"

@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/asciimoth/gonnect"
-	"github.com/asciimoth/gonnectnetstack/spoofer"
-	"github.com/asciimoth/gonnectnetstack/vtun"
+	"github.com/asciimoth/gonnect-netstack/spoofer"
+	"github.com/asciimoth/gonnect-netstack/vtun"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
