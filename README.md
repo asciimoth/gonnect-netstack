@@ -1,3 +1,7 @@
+<p align="center">
+<img src="./gonnect.svg" width="150" align="center">
+</p>
+
 # gonnect-netstack
 
 > [!IMPORTANT]
