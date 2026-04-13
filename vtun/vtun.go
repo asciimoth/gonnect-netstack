@@ -786,6 +786,13 @@ func (vt *VTun) dialUDP(
 	return callbackWrapped.(gonnect.UDPConn), nil
 }
 
+func (vt *VTun) PacketDial(
+	ctx context.Context,
+	network, raddr string,
+) (conn gonnect.PacketConn, err error) {
+	return vt.DialUDP(ctx, network, "", raddr)
+}
+
 func (vt *VTun) DialUDP(
 	ctx context.Context,
 	network, laddr, raddr string,
