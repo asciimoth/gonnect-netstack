@@ -2,6 +2,7 @@
 <img src="./gonnect.svg" width="150" align="center">
 </p>
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/asciimoth/gonnect-netstack.svg)](https://pkg.go.dev/github.com/asciimoth/gonnect-netstack)  
 # gonnect-netstack
 
 This module integrates
