@@ -82,6 +82,8 @@ type Opts struct {
 
 	// NetStackOpts provides additional netstack configuration options.
 	NetStackOpts *helpers.Opts
+
+	MWO, MRO int
 }
 
 func (o *Opts) name() string {
@@ -102,6 +104,20 @@ func (o *Opts) dns() []netip.Addr {
 		netip.MustParseAddr("1.0.0.1"),
 		netip.MustParseAddr("9.9.9.9"),
 	}
+}
+
+func (o *Opts) mwo() int {
+	if o != nil {
+		return o.MWO
+	}
+	return 0
+}
+
+func (o *Opts) mro() int {
+	if o != nil {
+		return o.MRO
+	}
+	return 0
 }
 
 func (o *Opts) lookup() gonnect.LookupIP {
@@ -190,6 +206,8 @@ func (o *Opts) Build() (*VTun, error) {
 		name:           o.name(),
 		lookup:         o.lookup(),
 		localAddrs:     localAddrs,
+		mwo:            o.mwo(),
+		mro:            o.mro(),
 	}
 	vt.notifyHandle = vt.ep.AddNotify(vt)
 	nid, err := helpers.CreateNIC(st, nil, vt.ep)
@@ -258,7 +276,12 @@ type VTun struct {
 	nid     tcpip.NICID
 	nextID  uint64
 	closers map[uint64]io.Closer
+
+	mwo, mro int
 }
+
+func (vt *VTun) MWO() int { return vt.mwo }
+func (vt *VTun) MRO() int { return vt.mro }
 
 // SetLookup sets a custom DNS lookup function for the VTun.
 func (vt *VTun) SetLookup(fn gonnect.LookupIP) {
