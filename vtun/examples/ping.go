@@ -54,17 +54,17 @@ func main() {
 	<-tunClient.Events()
 	<-tunServer.Events()
 
+	p2p := tun.NewP2P(nil)
+	defer p2p.Stop()
+	p2p.SetA(tunClient)
+	p2p.SetB(tunServer)
+
 	// Start packet forwarding
-	go func() {
-		if err := tun.Copy(tunClient, tunServer); err != nil {
-			log.Printf("Copy error: %v", err)
-		}
-	}()
-	go func() {
-		if err := tun.Copy(tunServer, tunClient); err != nil {
-			log.Printf("Copy error: %v", err)
-		}
-	}()
+	// go func() {
+	// 	if err := tun.Copy(tunClient, tunServer); err != nil {
+	// 		log.Printf("Copy error: %v", err)
+	// 	}
+	// }()
 
 	// Start server
 	go func() {
@@ -73,6 +73,7 @@ func main() {
 
 	// Start client (blocks)
 	client(tunClient, tun2Addr)
+	log.Println("Stopping")
 }
 
 func client(tnet *vtun.VTun, serverAddr netip.Addr) {

@@ -46,17 +46,21 @@ func setupVTunPair(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	<-vtun1.Events()
 	<-vtun2.Events()
 
+	p2p := tun.NewP2P(nil)
+	p2p.SetA(vtun1)
+	p2p.SetB(vtun2)
+
 	// Start packet forwarding between them
-	copyDone := make(chan struct{})
-	go func() {
-		defer close(copyDone)
-		tun.Copy(vtun1, vtun2)
-	}()
+	// copyDone := make(chan struct{})
+	// go func() {
+	// 	defer close(copyDone)
+	// 	tun.Copy(vtun1, vtun2)
+	// }()
 
 	cleanup := func() {
-		vtun1.Close()
-		vtun2.Close()
-		<-copyDone
+		// vtun1.Close()
+		// vtun2.Close()
+		p2p.Stop()
 	}
 
 	return vtun1, vtun2, cleanup
@@ -1365,17 +1369,21 @@ func setupVTunPairIPv6(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	<-vtun1.Events()
 	<-vtun2.Events()
 
+	p2p := tun.NewP2P(nil)
+	p2p.SetA(vtun1)
+	p2p.SetB(vtun2)
+
 	// Start packet forwarding between them
-	copyDone := make(chan struct{})
-	go func() {
-		defer close(copyDone)
-		tun.Copy(vtun1, vtun2)
-	}()
+	// copyDone := make(chan struct{})
+	// go func() {
+	// 	defer close(copyDone)
+	// 	tun.Copy(vtun1, vtun2)
+	// }()
 
 	cleanup := func() {
-		vtun1.Close()
-		vtun2.Close()
-		<-copyDone
+		// vtun1.Close()
+		// vtun2.Close()
+		p2p.Stop()
 	}
 
 	return vtun1, vtun2, cleanup

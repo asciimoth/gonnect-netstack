@@ -49,12 +49,17 @@ func main() {
 	<-tunClient.Events()
 	<-tunServer.Events()
 
-	// Start packet forwarding
-	go func() {
-		if err := tun.Copy(tunClient, tunServer); err != nil {
-			log.Printf("Copy error: %v", err)
-		}
-	}()
+	p2p := tun.NewP2P(nil)
+	defer p2p.Stop()
+	p2p.SetA(tunClient)
+	p2p.SetB(tunServer)
+
+	// // Start packet forwarding
+	// go func() {
+	// 	if err := tun.Copy(tunClient, tunServer); err != nil {
+	// 		log.Printf("Copy error: %v", err)
+	// 	}
+	// }()
 
 	// Start client
 	go func() {
