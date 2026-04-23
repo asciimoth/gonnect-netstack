@@ -23,6 +23,23 @@ var (
 // parameters (though most configuration methods are no-ops for this implementation).
 type TCPConn struct {
 	*gonet.TCPConn
+	Laddr, Raddr net.Addr
+}
+
+func (t *TCPConn) LocalAddr() net.Addr {
+	laddr := t.TCPConn.LocalAddr()
+	if laddr == nil {
+		laddr = t.Laddr
+	}
+	return laddr
+}
+
+func (t *TCPConn) RemoteAddr() net.Addr {
+	raddr := t.TCPConn.RemoteAddr()
+	if raddr == nil {
+		raddr = t.Raddr
+	}
+	return raddr
 }
 
 // ReadFrom copies data from the provided reader to the TCP connection.
@@ -70,6 +87,7 @@ func (t *TCPConn) SetNoDelay(noDelay bool) error {
 // formats (net.UDPAddr and netip.AddrPort).
 type UDPConn struct {
 	*gonet.UDPConn
+	Laddr, Raddr net.Addr
 }
 
 // ReadFromUDP reads a UDP packet and returns the number of bytes read, the remote
@@ -186,10 +204,35 @@ func (u *UDPConn) WriteMsgUDPAddrPort(
 	return n, 0, err
 }
 
+func (u *UDPConn) LocalAddr() net.Addr {
+	laddr := u.UDPConn.LocalAddr()
+	if laddr == nil {
+		laddr = u.Laddr
+	}
+	return laddr
+}
+
+func (u *UDPConn) RemoteAddr() net.Addr {
+	raddr := u.UDPConn.RemoteAddr()
+	if raddr == nil {
+		raddr = u.Raddr
+	}
+	return raddr
+}
+
 // TCPListener wraps a gonet.TCPListener and implements the gonnect.TCPListener
 // interface. It provides methods for accepting TCP connections.
 type TCPListener struct {
 	*gonet.TCPListener
+	Address net.Addr
+}
+
+func (l *TCPListener) Addr() net.Addr {
+	addr := l.TCPListener.Addr()
+	if addr == nil {
+		addr = l.Address
+	}
+	return addr
 }
 
 // Accept accepts the next incoming connection and returns it wrapped as a TCPConn.
@@ -199,7 +242,10 @@ func (l *TCPListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	if tc, ok := c.(*gonet.TCPConn); ok {
-		return &TCPConn{TCPConn: tc}, nil
+		return &TCPConn{
+			TCPConn: tc,
+			Laddr:   l.Addr(),
+		}, nil
 	}
 	return c, nil
 }

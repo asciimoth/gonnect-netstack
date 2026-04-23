@@ -323,7 +323,7 @@ func (vt *VTun) buildUnregCallback(id uint64) func() {
 
 // registerConnCallback registers an accepted connection and wraps it with callbacks.
 // Returns an error if the VTun is down.
-func (vt *VTun) registerConnCallback(conn net.Conn) (net.Conn, error) {
+func (vt *VTun) registerConnCallback(conn net.Conn, laddr, raddr net.Addr) (net.Conn, error) {
 	vt.mu.Lock()
 	defer vt.mu.Unlock()
 	if vt.down {
@@ -333,9 +333,17 @@ func (vt *VTun) registerConnCallback(conn net.Conn) (net.Conn, error) {
 	// Wrap with helpers types first if needed
 	var wrappedConn net.Conn
 	if tc, ok := conn.(*gonet.TCPConn); ok {
-		wrappedConn = &helpers.TCPConn{TCPConn: tc}
+		wrappedConn = &helpers.TCPConn{
+			TCPConn: tc,
+			Laddr:   laddr,
+			Raddr:   raddr,
+		}
 	} else if uc, ok := conn.(*gonet.UDPConn); ok {
-		wrappedConn = &helpers.UDPConn{UDPConn: uc}
+		wrappedConn = &helpers.UDPConn{
+			UDPConn: uc,
+			Laddr:   laddr,
+			Raddr:   raddr,
+		}
 	} else {
 		wrappedConn = conn
 	}
@@ -534,7 +542,7 @@ func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gone
 
 func (vt *VTun) dialTCP(
 	ctx context.Context,
-	raddr string,
+	network, raddr string,
 ) (gonnect.TCPConn, error) {
 	var err error
 	addr := netip.AddrPort{}
@@ -551,7 +559,11 @@ func (vt *VTun) dialTCP(
 	}
 
 	// Wrap with helpers.TCPConn first
-	wrapped := &helpers.TCPConn{TCPConn: conn}
+	wrapped := &helpers.TCPConn{
+		TCPConn: conn,
+		Laddr:   fallbackConnAddr(network, ""),
+		Raddr:   fallbackConnAddr(network, raddr),
+	}
 
 	// Register with callbacks
 	vt.mu.Lock()
@@ -578,7 +590,7 @@ func (vt *VTun) DialTCP(
 	err = vt.runWithLookup(
 		ctx, network, "", raddr, ge.ConnRefused(network, raddr),
 		func(laddr, raddr string) (bool, error) {
-			conn, err = vt.dialTCP(ctx, raddr)
+			conn, err = vt.dialTCP(ctx, network, raddr)
 			if err != nil {
 				return false, err
 			}
@@ -628,7 +640,7 @@ func (vt *VTun) ListenTCPAddrPort(addr netip.AddrPort) (*gonet.TCPListener, erro
 }
 
 func (vt *VTun) listenTCP(
-	laddr string,
+	network, laddr string,
 ) (gonnect.TCPListener, error) {
 	addr, err := helpers.AddrPortFromString(laddr)
 	if err != nil {
@@ -643,10 +655,19 @@ func (vt *VTun) listenTCP(
 	vt.mu.Lock()
 	id := vt.getID()
 	// Wrap with helpers.TCPListener first so ListenerWithCallbacks detects it as TCPListener
-	wrapped := &helpers.TCPListener{TCPListener: l}
+	wrapped := &helpers.TCPListener{
+		TCPListener: l,
+		Address:     fallbackListenerAddr(network, addr.String()),
+	}
 	listener := gonnect.ListenerWithCallbacks(wrapped, &gonnect.Callbacks{
 		BeforeClose: vt.buildUnregCallback(id),
-		OnAccept:    vt.registerConnCallback,
+		OnAccept: func(c net.Conn) (net.Conn, error) {
+			raddr := c.RemoteAddr()
+			if raddr == nil {
+				raddr = fallbackConnAddr(network, "")
+			}
+			return vt.registerConnCallback(c, fallbackConnAddr(network, addr.String()), raddr)
+		},
 	})
 	vt.register(id, listener)
 	vt.mu.Unlock()
@@ -664,7 +685,7 @@ func (vt *VTun) ListenTCP(
 	err = vt.runWithLookup(
 		ctx, network, laddr, "", ge.ListenDeniedErr(network, laddr),
 		func(laddr, raddr string) (bool, error) {
-			listener, err = vt.listenTCP(laddr)
+			listener, err = vt.listenTCP(network, laddr)
 			if err != nil {
 				return false, err
 			}
@@ -766,7 +787,7 @@ func (vt *VTun) LocalAddrs() []netip.Addr {
 }
 
 func (vt *VTun) dialUDP(
-	laddr, raddr string,
+	network, laddr, raddr string,
 ) (gonnect.UDPConn, error) {
 	var err error
 	lap := netip.AddrPort{}
@@ -794,7 +815,11 @@ func (vt *VTun) dialUDP(
 	}
 
 	// Wrap with helpers.UDPConn first
-	wrapped := &helpers.UDPConn{UDPConn: c}
+	wrapped := &helpers.UDPConn{
+		UDPConn: c,
+		Laddr:   fallbackConnAddr(network, laddr),
+		Raddr:   fallbackConnAddr(network, raddr),
+	}
 
 	// Register with callbacks
 	vt.mu.Lock()
@@ -826,7 +851,7 @@ func (vt *VTun) DialUDP(
 	err = vt.runWithLookup(
 		ctx, network, laddr, raddr, ge.ConnRefused(network, raddr),
 		func(laddr, raddr string) (bool, error) {
-			conn, err = vt.dialUDP(laddr, raddr)
+			conn, err = vt.dialUDP(network, laddr, raddr)
 			if err != nil {
 				return false, err
 			}
@@ -837,7 +862,7 @@ func (vt *VTun) DialUDP(
 }
 
 func (vt *VTun) listenUDP(
-	laddr string,
+	network, laddr string,
 ) (gonnect.UDPConn, error) {
 	addr, err := helpers.AddrPortFromString(laddr)
 	if err != nil {
@@ -850,7 +875,11 @@ func (vt *VTun) listenUDP(
 	}
 
 	// Wrap with helpers.UDPConn first
-	wrapped := &helpers.UDPConn{UDPConn: c}
+	wrapped := &helpers.UDPConn{
+		UDPConn: c,
+		Laddr:   fallbackConnAddr(network, addr.String()),
+		Raddr:   fallbackConnAddr(network, ""),
+	}
 
 	// Register with callbacks
 	vt.mu.Lock()
@@ -875,7 +904,7 @@ func (vt *VTun) ListenUDP(
 	err = vt.runWithLookup(
 		ctx, network, laddr, "", ge.ListenDeniedErr(network, laddr),
 		func(laddr, raddr string) (bool, error) {
-			conn, err = vt.listenUDP(laddr)
+			conn, err = vt.listenUDP(network, laddr)
 			if err != nil {
 				return false, err
 			}
@@ -883,6 +912,26 @@ func (vt *VTun) ListenUDP(
 		},
 	)
 	return
+}
+
+func fallbackConnAddr(network, addr string) net.Addr {
+	if addr == "" {
+		addr = "127.0.0.1:0"
+	}
+	return &gh.NetAddr{
+		Net:  network,
+		Addr: addr,
+	}
+}
+
+func fallbackListenerAddr(network, addr string) net.Addr {
+	if addr == "" {
+		addr = "0.0.0.0:0"
+	}
+	return &gh.NetAddr{
+		Net:  network,
+		Addr: addr,
+	}
 }
 
 func (vt *VTun) Dial(

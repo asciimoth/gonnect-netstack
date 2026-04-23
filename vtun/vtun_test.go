@@ -66,6 +66,178 @@ func setupVTunPair(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	return vtun1, vtun2, cleanup
 }
 
+func firstTestAddr(t *testing.T, vt *vtun.VTun, wantV6 bool) netip.Addr {
+	t.Helper()
+
+	for _, addr := range vt.LocalAddrs() {
+		if addr.IsLoopback() {
+			continue
+		}
+		if wantV6 && addr.Is6() {
+			return addr
+		}
+		if !wantV6 && addr.Is4() {
+			return addr
+		}
+	}
+
+	t.Fatalf("no usable address found for wantV6=%v", wantV6)
+	return netip.Addr{}
+}
+
+func assertConnAddrs(t *testing.T, name string, conn net.Conn) {
+	t.Helper()
+
+	if conn.LocalAddr() == nil {
+		t.Fatalf("%s LocalAddr() = nil", name)
+	}
+	if conn.RemoteAddr() == nil {
+		t.Fatalf("%s RemoteAddr() = nil", name)
+	}
+}
+
+func assertListenerAddr(t *testing.T, name string, listener net.Listener) {
+	t.Helper()
+
+	if listener.Addr() == nil {
+		t.Fatalf("%s Addr() = nil", name)
+	}
+}
+
+func testWrappedConnAddrs(
+	t *testing.T,
+	setup func(*testing.T) (*vtun.VTun, *vtun.VTun, func()),
+	tcpNetwork, udpNetwork string,
+) {
+	t.Helper()
+
+	vtun1, vtun2, cleanup := setup(t)
+	defer cleanup()
+
+	wantV6 := strings.HasSuffix(tcpNetwork, "6")
+	serverIP := firstTestAddr(t, vtun2, wantV6)
+	ctx := context.Background()
+
+	tcpAddr := netip.AddrPortFrom(serverIP, 28080).String()
+	tcpAddr2 := netip.AddrPortFrom(serverIP, 28081).String()
+	udpAddr := netip.AddrPortFrom(serverIP, 29090).String()
+	udpAddr2 := netip.AddrPortFrom(serverIP, 29091).String()
+
+	t.Run("DialTCP", func(t *testing.T) {
+		listener, err := vtun2.ListenTCP(ctx, tcpNetwork, tcpAddr)
+		if err != nil {
+			t.Fatalf("ListenTCP failed: %v", err)
+		}
+		defer listener.Close()
+		assertListenerAddr(t, "ListenTCP", listener)
+
+		acceptedCh := make(chan net.Conn, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			acceptedCh <- conn
+		}()
+
+		conn, err := vtun1.DialTCP(ctx, tcpNetwork, "", tcpAddr)
+		if err != nil {
+			t.Fatalf("DialTCP failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "DialTCP", conn)
+
+		select {
+		case err := <-errCh:
+			t.Fatalf("Accept failed: %v", err)
+		case accepted := <-acceptedCh:
+			defer accepted.Close()
+			assertConnAddrs(t, "ListenTCP.Accept", accepted)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for ListenTCP.Accept")
+		}
+	})
+
+	t.Run("Dial", func(t *testing.T) {
+		listener, err := vtun2.Listen(ctx, tcpNetwork, tcpAddr2)
+		if err != nil {
+			t.Fatalf("Listen failed: %v", err)
+		}
+		defer listener.Close()
+		assertListenerAddr(t, "Listen", listener)
+
+		acceptedCh := make(chan net.Conn, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			acceptedCh <- conn
+		}()
+
+		conn, err := vtun1.Dial(ctx, tcpNetwork, tcpAddr2)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "Dial", conn)
+
+		select {
+		case err := <-errCh:
+			t.Fatalf("Accept failed: %v", err)
+		case accepted := <-acceptedCh:
+			defer accepted.Close()
+			assertConnAddrs(t, "Listen.Accept", accepted)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for Listen.Accept")
+		}
+	})
+
+	t.Run("DialUDP", func(t *testing.T) {
+		conn, err := vtun1.DialUDP(ctx, udpNetwork, "", udpAddr)
+		if err != nil {
+			t.Fatalf("DialUDP failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "DialUDP", conn)
+	})
+
+	t.Run("PacketDial", func(t *testing.T) {
+		conn, err := vtun1.PacketDial(ctx, udpNetwork, udpAddr)
+		if err != nil {
+			t.Fatalf("PacketDial failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "PacketDial", conn)
+	})
+
+	t.Run("ListenUDP", func(t *testing.T) {
+		conn, err := vtun2.ListenUDP(ctx, udpNetwork, udpAddr)
+		if err != nil {
+			t.Fatalf("ListenUDP failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "ListenUDP", conn)
+	})
+
+	t.Run("ListenPacket", func(t *testing.T) {
+		conn, err := vtun2.ListenPacket(ctx, udpNetwork, udpAddr2)
+		if err != nil {
+			t.Fatalf("ListenPacket failed: %v", err)
+		}
+		defer conn.Close()
+		assertConnAddrs(t, "ListenPacket", conn)
+	})
+}
+
+func TestVTunWrappedConnAddrsIPv4(t *testing.T) {
+	testWrappedConnAddrs(t, setupVTunPair, "tcp4", "udp4")
+}
+
 // TestVTunUpDownBehavior tests the Up/Down functionality of VTun.
 func TestVTunUpDownBehavior(t *testing.T) {
 	opts := vtun.Opts{
@@ -1387,6 +1559,10 @@ func setupVTunPairIPv6(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	}
 
 	return vtun1, vtun2, cleanup
+}
+
+func TestVTunWrappedConnAddrsIPv6(t *testing.T) {
+	testWrappedConnAddrs(t, setupVTunPairIPv6, "tcp6", "udp6")
 }
 
 // TestVTunIPv6UpDownBehavior tests the Up/Down functionality of VTun with IPv6.
