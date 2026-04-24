@@ -399,13 +399,32 @@ func (vt *VTun) SetDnsServers(servers []netip.Addr) {
 // WriteNotify is called when the endpoint has data available. It reads a packet
 // from the endpoint and sends it to the incomingPacket channel.
 func (vt *VTun) WriteNotify() {
-	pkt := vt.ep.Read()
-	if pkt == nil {
+	for {
+		pkt := vt.ep.Read()
+		if pkt == nil {
+			return
+		}
+
+		view := pkt.ToView()
+		pkt.DecRef()
+		vt.enqueueIncomingView(view)
+	}
+}
+
+func (vt *VTun) enqueueIncomingView(view *buffer.View) {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
+
+	if vt.closed {
+		view.Release()
 		return
 	}
-	view := pkt.ToView()
-	pkt.DecRef()
-	vt.incomingPacket <- view
+
+	select {
+	case vt.incomingPacket <- view:
+	default:
+		view.Release()
+	}
 }
 
 // Name returns the name of the tun device.
@@ -441,6 +460,7 @@ func (vt *VTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 	if !ok {
 		return 0, os.ErrClosed
 	}
+	defer view.Release()
 
 	n, err := view.Read(buf[0][offset:])
 	if err != nil {
@@ -477,27 +497,37 @@ func (vt *VTun) Write(buf [][]byte, offset int) (int, error) {
 // removing notifications, closing the endpoint, and closing the channels.
 func (vt *VTun) Close() error {
 	vt.mu.Lock()
-	defer vt.mu.Unlock()
-
 	if vt.closed {
+		vt.mu.Unlock()
 		return nil
 	}
-
 	vt.closed = true
+	events := vt.events
+	incomingPacket := vt.incomingPacket
+	vt.mu.Unlock()
 
-	vt.stack.RemoveNIC(vt.nid)
-	vt.stack.Close()
 	vt.ep.RemoveNotify(vt.notifyHandle)
 	vt.ep.Close()
+	vt.stack.RemoveNIC(vt.nid)
+	vt.stack.Close()
 
-	if vt.events != nil {
-		close(vt.events)
+	if events != nil {
+		close(events)
 	}
 
-	if vt.incomingPacket != nil {
-		close(vt.incomingPacket)
+	if incomingPacket != nil {
+		for {
+			select {
+			case view := <-incomingPacket:
+				if view != nil {
+					view.Release()
+				}
+			default:
+				close(incomingPacket)
+				return nil
+			}
+		}
 	}
-
 	return nil
 }
 
