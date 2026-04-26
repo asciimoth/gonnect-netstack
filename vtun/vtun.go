@@ -280,6 +280,10 @@ type VTun struct {
 	mwo, mro int
 }
 
+func (vt *VTun) IsNative() bool {
+	return false
+}
+
 func (vt *VTun) MWO() int { return vt.mwo }
 func (vt *VTun) MRO() int { return vt.mro }
 
