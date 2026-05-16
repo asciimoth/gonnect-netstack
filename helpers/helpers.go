@@ -13,7 +13,6 @@ import (
 	"strconv"
 
 	"github.com/asciimoth/gonnect"
-	"github.com/asciimoth/gonnect/helpers"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -100,7 +99,7 @@ loop:
 		default:
 			continue loop
 		}
-		addrs = append(addrs, &helpers.NetAddr{
+		addrs = append(addrs, &gonnect.NetAddr{
 			Net:  network,
 			Addr: paddr.AddressWithPrefix.Address.String(),
 		})

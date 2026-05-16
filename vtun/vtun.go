@@ -25,8 +25,6 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/asciimoth/gonnect-netstack/helpers"
-	ge "github.com/asciimoth/gonnect/errors"
-	gh "github.com/asciimoth/gonnect/helpers"
 	"github.com/asciimoth/gonnect/tun"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -46,11 +44,10 @@ import (
 
 // Static type assertions
 var (
-	_ gonnect.Network          = &VTun{}
-	_ gonnect.Resolver         = &VTun{}
-	_ gonnect.InterfaceNetwork = &VTun{}
-	_ gonnect.UpDown           = &VTun{}
-	_ tun.Tun                  = &VTun{}
+	_ gonnect.Network  = &VTun{}
+	_ gonnect.Resolver = &VTun{}
+	_ gonnect.UpDown   = &VTun{}
+	_ tun.Tun          = &VTun{}
 
 	_ gonnect.LookupHost = (&VTun{}).LookupHost
 )
@@ -618,11 +615,11 @@ func (vt *VTun) DialTCP(
 	ctx context.Context,
 	network, laddr, raddr string,
 ) (conn gonnect.TCPConn, err error) {
-	if !gh.IsTCPNetwork(network) {
+	if !gonnect.IsTCPNetwork(network) {
 		return nil, net.UnknownNetworkError(network)
 	}
 	err = vt.runWithLookup(
-		ctx, network, "", raddr, ge.ConnRefused(network, raddr),
+		ctx, network, "", raddr, gonnect.ConnRefused(network, raddr),
 		func(laddr, raddr string) (bool, error) {
 			conn, err = vt.dialTCP(ctx, network, raddr)
 			if err != nil {
@@ -713,11 +710,11 @@ func (vt *VTun) ListenTCP(
 	ctx context.Context,
 	network, laddr string,
 ) (listener gonnect.TCPListener, err error) {
-	if !gh.IsTCPNetwork(network) {
+	if !gonnect.IsTCPNetwork(network) {
 		return nil, net.UnknownNetworkError(network)
 	}
 	err = vt.runWithLookup(
-		ctx, network, laddr, "", ge.ListenDeniedErr(network, laddr),
+		ctx, network, laddr, "", gonnect.ListenDeniedErr(network, laddr),
 		func(laddr, raddr string) (bool, error) {
 			listener, err = vt.listenTCP(network, laddr)
 			if err != nil {
@@ -879,11 +876,11 @@ func (vt *VTun) DialUDP(
 	ctx context.Context,
 	network, laddr, raddr string,
 ) (conn gonnect.UDPConn, err error) {
-	if !gh.IsUDPNetwork(network) {
+	if !gonnect.IsUDPNetwork(network) {
 		return nil, net.UnknownNetworkError(network)
 	}
 	err = vt.runWithLookup(
-		ctx, network, laddr, raddr, ge.ConnRefused(network, raddr),
+		ctx, network, laddr, raddr, gonnect.ConnRefused(network, raddr),
 		func(laddr, raddr string) (bool, error) {
 			conn, err = vt.dialUDP(network, laddr, raddr)
 			if err != nil {
@@ -932,11 +929,11 @@ func (vt *VTun) ListenUDP(
 	ctx context.Context,
 	network, laddr string,
 ) (conn gonnect.UDPConn, err error) {
-	if !gh.IsUDPNetwork(network) {
+	if !gonnect.IsUDPNetwork(network) {
 		return nil, net.UnknownNetworkError(network)
 	}
 	err = vt.runWithLookup(
-		ctx, network, laddr, "", ge.ListenDeniedErr(network, laddr),
+		ctx, network, laddr, "", gonnect.ListenDeniedErr(network, laddr),
 		func(laddr, raddr string) (bool, error) {
 			conn, err = vt.listenUDP(network, laddr)
 			if err != nil {
@@ -952,7 +949,7 @@ func fallbackConnAddr(network, addr string) net.Addr {
 	if addr == "" {
 		addr = "127.0.0.1:0"
 	}
-	return &gh.NetAddr{
+	return &gonnect.NetAddr{
 		Net:  network,
 		Addr: addr,
 	}
@@ -962,7 +959,7 @@ func fallbackListenerAddr(network, addr string) net.Addr {
 	if addr == "" {
 		addr = "0.0.0.0:0"
 	}
-	return &gh.NetAddr{
+	return &gonnect.NetAddr{
 		Net:  network,
 		Addr: addr,
 	}
@@ -972,10 +969,10 @@ func (vt *VTun) Dial(
 	ctx context.Context,
 	network, address string,
 ) (net.Conn, error) {
-	if gh.IsTCPNetwork(network) {
+	if gonnect.IsTCPNetwork(network) {
 		return vt.DialTCP(ctx, network, "", address)
 	}
-	if gh.IsUDPNetwork(network) {
+	if gonnect.IsUDPNetwork(network) {
 		return vt.DialUDP(ctx, network, "", address)
 	}
 	// TODO: Handle Ping dialing also
@@ -994,6 +991,36 @@ func (vt *VTun) ListenPacket(
 	network, address string,
 ) (gonnect.PacketConn, error) {
 	return vt.ListenUDP(ctx, network, address)
+}
+
+func (vt *VTun) ListenPacketConfig(
+	ctx context.Context,
+	lc *gonnect.ListenConfig,
+	network, address string,
+) (gonnect.PacketConn, error) {
+	return vt.ListenPacket(ctx, network, address)
+}
+
+func (vt *VTun) ListenUDPConfig(
+	ctx context.Context,
+	lc *gonnect.ListenConfig,
+	network, laddr string,
+) (gonnect.UDPConn, error) {
+	return vt.ListenUDP(ctx, network, laddr)
+}
+
+func (vt *VTun) ListenMulticastUDP(
+	ctx context.Context,
+	network, address string,
+	opts gonnect.MulticastOptions,
+) (gonnect.MulticastPacketConn, error) {
+	if !gonnect.IsUDPNetwork(network) {
+		return nil, net.UnknownNetworkError(network)
+	}
+	if err := vt.checkUp(); err != nil {
+		return nil, err
+	}
+	return nil, gonnect.ErrUnsupported
 }
 
 // DialPingAddr creates an ICMP ping connection with the specified local and
@@ -1315,7 +1342,7 @@ func (vt *VTun) runWithLookup(
 func (vt *VTun) LookupIP(
 	ctx context.Context, network, address string,
 ) ([]net.IP, error) {
-	fam := gh.FamilyFromNetwork(network)
+	fam := gonnect.FamilyFromNetwork(network)
 	v4 := fam == "ip4" || fam == "ip"
 	v6 := fam == "ip6" || fam == "ip"
 	ips := []net.IP{}
@@ -1373,11 +1400,11 @@ func (vt *VTun) LookupNetIP(
 }
 
 func (vt *VTun) LookupAddr(ctx context.Context, addr string) (names []string, err error) {
-	return nil, ge.DnsReqErr(addr, "unsupported")
+	return nil, gonnect.DnsReqErr(addr, "unsupported")
 }
 
 func (vt *VTun) LookupCNAME(ctx context.Context, host string) (cname string, err error) {
-	return "", ge.DnsReqErr(host, "unsupported")
+	return "", gonnect.DnsReqErr(host, "unsupported")
 }
 
 func (vt *VTun) LookupPort(
@@ -1402,7 +1429,7 @@ func (vt *VTun) LookupNS(ctx context.Context, name string) ([]*net.NS, error) {
 		// (we don't support actual MX lookups)
 		_ = ips
 	}
-	return nil, ge.DnsReqErr(name, "unsupported")
+	return nil, gonnect.DnsReqErr(name, "unsupported")
 }
 
 func (vt *VTun) LookupMX(
@@ -1420,7 +1447,7 @@ func (vt *VTun) LookupMX(
 			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 		}
 	}
-	return nil, ge.DnsReqErr(name, "unsupported")
+	return nil, gonnect.DnsReqErr(name, "unsupported")
 }
 
 func (vt *VTun) LookupSRV(
@@ -1440,7 +1467,7 @@ func (vt *VTun) LookupSRV(
 			return "", nil, &net.DNSError{Err: "no such host", Name: fullName, IsNotFound: true}
 		}
 	}
-	return "", nil, ge.DnsReqErr(name, "unsupported")
+	return "", nil, gonnect.DnsReqErr(name, "unsupported")
 }
 
 func (vt *VTun) LookupTXT(
@@ -1458,7 +1485,7 @@ func (vt *VTun) LookupTXT(
 			return nil, &net.DNSError{Err: "no such host", Name: name, IsNotFound: true}
 		}
 	}
-	return nil, ge.DnsReqErr(name, "unsupported")
+	return nil, gonnect.DnsReqErr(name, "unsupported")
 }
 
 // LookupHost performs a DNS lookup for the given host name and returns a list
@@ -1618,6 +1645,15 @@ func (vt *VTun) InterfaceAddrs() ([]net.Addr, error) {
 	addrs := []net.Addr{}
 	for k, v := range vt.stack.NICInfo() {
 		ads, _ := helpers.NIC2Iface(k, v).Addrs()
+		addrs = append(addrs, ads...)
+	}
+	return slices.Compact(addrs), nil
+}
+
+func (vt *VTun) InterfaceMulticastAddrs() ([]net.Addr, error) {
+	addrs := []net.Addr{}
+	for k, v := range vt.stack.NICInfo() {
+		ads, _ := helpers.NIC2Iface(k, v).MulticastAddrs()
 		addrs = append(addrs, ads...)
 	}
 	return slices.Compact(addrs), nil
