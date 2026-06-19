@@ -148,10 +148,10 @@ func (o *Opts) laddrs() []netip.Addr {
 		return laddrs
 	}
 	laddrs := []netip.Addr{}
-	if ip4 := o.opts().GetIPAlloc().Alloc4(); ip4 != nil && ip4.To4() != nil {
+	if ip4, _ := o.opts().GetIPAlloc().AllocIP4(); ip4 != nil && ip4.To4() != nil {
 		laddrs = append(laddrs, netip.AddrFrom4([4]byte(ip4.To4())))
 	}
-	if ip6 := o.opts().GetIPAlloc().Alloc6(); ip6 != nil && ip6.To16() != nil {
+	if ip6, _ := o.opts().GetIPAlloc().AllocIP6(); ip6 != nil && ip6.To16() != nil {
 		laddrs = append(laddrs, netip.AddrFrom16([16]byte(ip6.To16())))
 	}
 	if !o.NoLoopbackAddr {

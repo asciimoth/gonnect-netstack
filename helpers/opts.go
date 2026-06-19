@@ -38,9 +38,7 @@ func (o *Opts) GetIPAlloc() subnet.IPAllocator {
 	if o != nil && o.IPAlloc != nil {
 		return o.IPAlloc
 	}
-	return subnet.NewRandomIPAllocator(&subnet.RandomIPAllocatorConfig{
-		IPv4Config: &subnet.RandomAllocatorConfig{},
-	})
+	return subnet.NewDefaultAllocator(subnet.DefaultAllocatorConfig{})
 }
 
 func (o *Opts) sack() bool {
