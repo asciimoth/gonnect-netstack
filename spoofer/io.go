@@ -148,7 +148,9 @@ func (e *ioEndpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 type tunEndpoint struct {
 	*channel.Endpoint
 
-	tun tun.Tun
+	tun         tun.Tun
+	readOffset  int
+	writeOffset int
 
 	// once is used to perform the init action once when attaching.
 	once sync.Once
@@ -174,12 +176,23 @@ func NewTunEndpoint(tun tun.Tun, qlen int) *tunEndpoint {
 		qlen = 1024
 	}
 
+	readOffset := tun.MRO()
+	if readOffset < 0 {
+		readOffset = 0
+	}
+	writeOffset := tun.MWO()
+	if writeOffset < 0 {
+		writeOffset = 0
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &tunEndpoint{
-		Endpoint: channel.New(qlen, uint32(mtu), ""),
-		tun:      tun,
-		ctx:      ctx,
-		cancel:   cancel,
+		Endpoint:    channel.New(qlen, uint32(mtu), ""),
+		tun:         tun,
+		readOffset:  readOffset,
+		writeOffset: writeOffset,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -223,11 +236,11 @@ func (e *tunEndpoint) reader() {
 	bufs := make([][]byte, batchSize)
 	sizes := make([]int, batchSize)
 	for i := range bufs {
-		bufs[i] = make([]byte, e.MTU())
+		bufs[i] = make([]byte, e.readOffset+int(e.MTU()))
 	}
 
 	for {
-		n, err := e.tun.Read(bufs, sizes, 0)
+		n, err := e.tun.Read(bufs, sizes, e.readOffset)
 		if err != nil {
 			break
 		}
@@ -237,11 +250,15 @@ func (e *tunEndpoint) reader() {
 		}
 
 		for i := range n {
-			if sizes[i] == 0 {
+			if sizes[i] <= 0 {
 				continue
 			}
 
-			data := bufs[i][:sizes[i]]
+			end := e.readOffset + sizes[i]
+			if end > len(bufs[i]) {
+				continue
+			}
+			data := bufs[i][e.readOffset:end]
 
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(data),
@@ -278,7 +295,12 @@ func (e *tunEndpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	defer buf.Release()
 
 	flat := buf.Flatten()
-	_, err := e.tun.Write([][]byte{flat}, 0)
+	if e.writeOffset > 0 {
+		packet := make([]byte, e.writeOffset+len(flat))
+		copy(packet[e.writeOffset:], flat)
+		flat = packet
+	}
+	_, err := e.tun.Write([][]byte{flat}, e.writeOffset)
 	if err != nil {
 		return &tcpip.ErrInvalidEndpointState{}
 	}
