@@ -3,6 +3,7 @@ package vtun_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,9 +14,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asciimoth/gonnect"
 	"github.com/asciimoth/gonnect-netstack/vtun"
 	gt "github.com/asciimoth/gonnect/testing"
 	"github.com/asciimoth/gonnect/tun"
+)
+
+const (
+	udpPingPongClients     = 30
+	udpPingPongRounds      = 30
+	udpPingPongMaxRetries  = 5
+	udpPingPongReadTimeout = 100 * time.Millisecond
+	udpPingPongTestTimeout = 10 * time.Second
 )
 
 // setupVTunPair creates two connected VTun instances for testing.
@@ -1488,6 +1498,163 @@ func TestNativeNetworkHTTP(t *testing.T) {
 	gt.RunSimpleHTTPForNetworks(t, pair, pair)
 }
 
+func runUdpPingPongForNetworks(t *testing.T, a, b gt.NetAddrPair) {
+	t.Helper()
+
+	ctx := context.Background()
+	lnA, err := a.Network.ListenUDP(ctx, "udp", b.Addr)
+	if err != nil {
+		t.Fatalf("listen A: %v", err)
+	}
+	defer lnA.Close()
+
+	lnB, err := b.Network.ListenUDP(ctx, "udp", b.Addr)
+	if err != nil {
+		t.Fatalf("listen B: %v", err)
+	}
+	defer lnB.Close()
+
+	dialA := func(serverAddr net.Addr) (gonnect.PacketConn, error) {
+		return a.Network.PacketDial(ctx, serverAddr.Network(), serverAddr.String())
+	}
+	dialB := func(serverAddr net.Addr) (gonnect.PacketConn, error) {
+		return b.Network.PacketDial(ctx, serverAddr.Network(), serverAddr.String())
+	}
+
+	runUDPPingPong(t, lnA, dialB)
+	runUDPPingPong(t, lnB, dialA)
+}
+
+func runUDPPingPong(t *testing.T, server net.PacketConn, dial gt.DialPacketFunc) {
+	t.Helper()
+
+	done := make(chan struct{})
+	serverDone := make(chan struct{})
+	errCh := make(chan error, 1)
+	reportErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	go func() {
+		defer close(serverDone)
+
+		buf := make([]byte, 2048)
+		for {
+			_ = server.SetReadDeadline(time.Now().Add(udpPingPongReadTimeout))
+			n, src, err := server.ReadFrom(buf)
+			if err != nil {
+				select {
+				case <-done:
+					return
+				default:
+				}
+
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				reportErr(fmt.Errorf("server read: %w", err))
+				return
+			}
+
+			var clientID, seq int
+			if _, err := fmt.Sscanf(string(buf[:n]), "ping %d %d", &clientID, &seq); err != nil {
+				reportErr(fmt.Errorf("server parse %q: %w", string(buf[:n]), err))
+				return
+			}
+
+			reply := fmt.Sprintf("pong %d %d", clientID, seq)
+			if _, err := server.WriteTo([]byte(reply), src); err != nil {
+				reportErr(fmt.Errorf("server write to %s: %w", src, err))
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for clientID := range udpPingPongClients {
+		wg.Go(func() {
+			client, err := dial(server.LocalAddr())
+			if err != nil {
+				reportErr(fmt.Errorf("client %d dial: %w", clientID, err))
+				return
+			}
+			defer client.Close()
+
+			buf := make([]byte, 2048)
+			for seq := 1; seq <= udpPingPongRounds; seq++ {
+				msg := fmt.Sprintf("ping %d %d", clientID, seq)
+				want := fmt.Sprintf("pong %d %d", clientID, seq)
+
+				for attempt := 1; attempt <= udpPingPongMaxRetries; attempt++ {
+					select {
+					case <-done:
+						return
+					default:
+					}
+
+					if _, err := client.Write([]byte(msg)); err != nil {
+						reportErr(fmt.Errorf("client %d seq %d write: %w", clientID, seq, err))
+						return
+					}
+
+					_ = client.SetReadDeadline(time.Now().Add(udpPingPongReadTimeout))
+					n, _, err := client.ReadFrom(buf)
+					if err != nil {
+						var netErr net.Error
+						if errors.As(err, &netErr) && netErr.Timeout() {
+							continue
+						}
+						reportErr(fmt.Errorf("client %d seq %d read: %w", clientID, seq, err))
+						return
+					}
+
+					if got := string(buf[:n]); got == want {
+						goto nextSeq
+					}
+				}
+
+				reportErr(fmt.Errorf("client %d seq %d: no pong after %d attempts", clientID, seq, udpPingPongMaxRetries))
+				return
+
+			nextSeq:
+			}
+		})
+	}
+
+	clientsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(clientsDone)
+	}()
+
+	select {
+	case <-clientsDone:
+	case err := <-errCh:
+		close(done)
+		<-clientsDone
+		<-serverDone
+		t.Fatal(err)
+	case <-time.After(udpPingPongTestTimeout):
+		close(done)
+		<-clientsDone
+		<-serverDone
+		t.Fatalf("udp ping-pong timed out after %v", udpPingPongTestTimeout)
+	}
+
+	close(done)
+	<-serverDone
+
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+}
+
 func TestNativeNetworkUdpPingPong(t *testing.T) {
 	opts := vtun.Opts{}
 	vtun, err := opts.Build()
@@ -1499,7 +1666,7 @@ func TestNativeNetworkUdpPingPong(t *testing.T) {
 		Network: vtun,
 		Addr:    "127.0.0.1:0",
 	}
-	gt.RunUdpPingPongForNetworks(t, pair, pair)
+	runUdpPingPongForNetworks(t, pair, pair)
 }
 
 func TestNativeNetwork_Stoppable(t *testing.T) {
@@ -2593,7 +2760,7 @@ func TestNativeNetworkIPv6UdpPingPong(t *testing.T) {
 		Network: vtun,
 		Addr:    "[::1]:0",
 	}
-	gt.RunUdpPingPongForNetworks(t, pair, pair)
+	runUdpPingPongForNetworks(t, pair, pair)
 }
 
 // TestNativeNetworkIPv6Stoppable tests IPv6 stoppable network.
