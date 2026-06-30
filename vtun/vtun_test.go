@@ -56,7 +56,7 @@ func setupVTunPair(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	<-vtun1.Events()
 	<-vtun2.Events()
 
-	p2p := tun.NewP2P(nil)
+	p2p := tun.NewP2P(nil, nil)
 	p2p.SetA(vtun1)
 	p2p.SetB(vtun2)
 
@@ -1708,7 +1708,7 @@ func setupVTunPairIPv6(t *testing.T) (*vtun.VTun, *vtun.VTun, func()) {
 	<-vtun1.Events()
 	<-vtun2.Events()
 
-	p2p := tun.NewP2P(nil)
+	p2p := tun.NewP2P(nil, nil)
 	p2p.SetA(vtun1)
 	p2p.SetB(vtun2)
 
