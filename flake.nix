@@ -64,6 +64,7 @@
 
           typos
           commitizen
+          just
         ];
       };
     });
