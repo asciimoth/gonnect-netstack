@@ -3,7 +3,7 @@ module github.com/asciimoth/gonnect-netstack
 go 1.25.5
 
 require (
-	github.com/asciimoth/gonnect v0.35.0
+	github.com/asciimoth/gonnect v0.36.0
 	golang.org/x/net v0.54.0
 	golang.org/x/time v0.12.0
 	gvisor.dev/gvisor v0.0.0-20260325202830-7644cf3a343c
