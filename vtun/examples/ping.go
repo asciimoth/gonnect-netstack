@@ -3,14 +3,9 @@
 package main
 
 import (
-	"bytes"
 	"log"
-	"math/rand"
 	"net/netip"
 	"time"
-
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
 
 	"github.com/asciimoth/gonnect-netstack/vtun"
 	"github.com/asciimoth/gonnect/tun"
@@ -54,22 +49,10 @@ func main() {
 	<-tunClient.Events()
 	<-tunServer.Events()
 
-	p2p := tun.NewP2P(nil)
+	p2p := tun.NewP2P(nil, nil)
 	defer p2p.Stop()
 	p2p.SetA(tunClient)
 	p2p.SetB(tunServer)
-
-	// Start packet forwarding
-	// go func() {
-	// 	if err := tun.Copy(tunClient, tunServer); err != nil {
-	// 		log.Printf("Copy error: %v", err)
-	// 	}
-	// }()
-
-	// Start server
-	go func() {
-		serve(tunServer, tun2Addr)
-	}()
 
 	// Start client (blocks)
 	client(tunClient, tun2Addr)
@@ -86,82 +69,20 @@ func client(tnet *vtun.VTun, serverAddr netip.Addr) {
 	}
 	defer socket.Close()
 
-	requestPing := icmp.Echo{
-		Seq:  rand.Intn(1 << 16),
-		Data: []byte("gopher burrow"),
-	}
-	icmpBytes, _ := (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
+	payload := []byte("gopher burrow")
+	buf := make([]byte, 1024)
 	socket.SetReadDeadline(time.Now().Add(time.Second * 10))
 	start := time.Now()
-	_, err = socket.Write(icmpBytes)
+	_, err = socket.Write(payload)
 	if err != nil {
 		log.Panic(err)
 	}
-	n, err := socket.Read(icmpBytes[:])
+	n, err := socket.Read(buf)
 	if err != nil {
 		log.Panic(err)
 	}
-	replyPacket, err := icmp.ParseMessage(1, icmpBytes[:n])
-	if err != nil {
-		log.Panic(err)
-	}
-	replyPing, ok := replyPacket.Body.(*icmp.Echo)
-	if !ok {
-		log.Panicf("invalid reply type: %v", replyPacket)
-	}
-	if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
-		log.Panicf("invalid ping reply: %v", replyPing)
+	if string(buf[:n]) != string(payload) {
+		log.Panicf("invalid ping reply: %q", buf[:n])
 	}
 	log.Printf("Ping latency: %v", time.Since(start))
-}
-
-func serve(tnet *vtun.VTun, serverAddr netip.Addr) {
-	listener, err := tnet.ListenPingAddr(serverAddr)
-	if err != nil {
-		log.Panicln(err)
-	}
-
-	log.Println("ping server up")
-
-	buf := make([]byte, 1024)
-	for {
-		n, addr, err := listener.ReadFrom(buf)
-		if err != nil {
-			log.Println("read error:", err)
-			continue
-		}
-		log.Println("ping packet received")
-
-		msg, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), buf[:n])
-		if err != nil {
-			log.Println("parse error:", err)
-			continue
-		}
-
-		switch msg.Type {
-		case ipv4.ICMPTypeEcho:
-			echo := msg.Body.(*icmp.Echo)
-			log.Printf("Ping received from %s: id=%d, seq=%d, data=%q", addr, echo.ID, echo.Seq, string(echo.Data))
-
-			reply := icmp.Message{
-				Type: ipv4.ICMPTypeEchoReply,
-				Code: 0,
-				Body: &icmp.Echo{
-					ID:   echo.ID,
-					Seq:  echo.Seq,
-					Data: echo.Data,
-				},
-			}
-			replyBytes, err := reply.Marshal(nil)
-			if err != nil {
-				log.Println("marshal error:", err)
-				continue
-			}
-			_, err = listener.WriteTo(replyBytes, addr)
-			if err != nil {
-				log.Println("write error:", err)
-			}
-			log.Printf("Ping reply sent to %s", addr)
-		}
-	}
 }

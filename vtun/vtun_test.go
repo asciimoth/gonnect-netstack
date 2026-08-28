@@ -539,17 +539,39 @@ func TestVTunUDPClientServer(t *testing.T) {
 	}
 }
 
-// TestVTunICMPEcho tests ICMP ping between two connected VTun instances.
-// Note: This test is currently skipped due to gVisor ICMP endpoint state management issues.
-// The PingConn implementation requires specific endpoint states that aren't properly
-// initialized in the current VTun setup.
-func TestVTunICMPEcho(t *testing.T) {
-	t.Skip("ICMP endpoint state management in gVisor requires further investigation")
+func TestVTunLookupNetIPUnmapsIPv4(t *testing.T) {
+	vt, err := (&vtun.Opts{
+		LocalAddrs: []netip.Addr{netip.MustParseAddr("192.168.101.1")},
+		Lookup: func(ctx context.Context, network, host string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("104.20.23.154")}, nil
+		},
+	}).Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+	defer vt.Close()
+	<-vt.Events()
 
+	addrs, err := vt.LookupNetIP(context.Background(), "ip4", "example.com")
+	if err != nil {
+		t.Fatalf("LookupNetIP failed: %v", err)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("LookupNetIP returned %d addresses, want 1", len(addrs))
+	}
+	if !addrs[0].Is4() {
+		t.Fatalf("LookupNetIP address = %s, want true IPv4", addrs[0])
+	}
+	if got := addrs[0].String(); got != "104.20.23.154" {
+		t.Fatalf("LookupNetIP address = %s, want 104.20.23.154", got)
+	}
+}
+
+// TestVTunICMPEcho tests ICMP ping payloads between two connected VTun instances.
+func TestVTunICMPEcho(t *testing.T) {
 	vtun1, vtun2, cleanup := setupVTunPair(t)
 	defer cleanup()
 
-	// Get vtun2's first IPv4 address for target
 	vtun2Addrs := vtun2.LocalAddrs()
 	var targetAddr netip.Addr
 	for _, addr := range vtun2Addrs {
@@ -562,51 +584,21 @@ func TestVTunICMPEcho(t *testing.T) {
 		t.Fatal("No IPv4 address found for vtun2")
 	}
 
-	// Create ping connection on vtun2 (listener) - bound to address but not connected
-	pingListener, err := vtun2.DialPingAddr(targetAddr, netip.Addr{})
-	if err != nil {
-		t.Fatalf("DialPingAddr for listener failed: %v", err)
-	}
-	defer pingListener.Close()
-
-	// Start ping responder
-	pingDone := make(chan struct{})
-	go func() {
-		defer close(pingDone)
-		buf := make([]byte, 1024)
-		for {
-			n, from, err := pingListener.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-
-			// Echo back the data (simple ICMP echo)
-			_, err = pingListener.WriteTo(buf[:n], from)
-			if err != nil {
-				t.Logf("Ping responder error: %v", err)
-				return
-			}
-		}
-	}()
-
-	// Give listener time to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Create ping connection from vtun1 - connected to target
 	pingConn, err := vtun1.DialPingAddr(netip.Addr{}, targetAddr)
 	if err != nil {
 		t.Fatalf("DialPingAddr failed: %v", err)
 	}
 	defer pingConn.Close()
 
-	// Send ping using Write (connected socket)
 	testData := []byte("ICMP echo request")
-	_, err = pingConn.Write(testData)
+	n, err := pingConn.Write(testData)
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
+	if n != len(testData) {
+		t.Fatalf("Write returned %d, want %d", n, len(testData))
+	}
 
-	// Wait for reply
 	pingConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1024)
 	n, from, err := pingConn.ReadFrom(buf)
@@ -622,10 +614,6 @@ func TestVTunICMPEcho(t *testing.T) {
 	if string(buf[:n]) != string(testData) {
 		t.Errorf("Expected echo reply %q, got %q", testData, buf[:n])
 	}
-
-	pingConn.Close()
-	pingListener.Close()
-	<-pingDone
 }
 
 // TestVTunDNSResolution tests DNS resolution through VTun.

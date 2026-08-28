@@ -7,20 +7,25 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/asciimoth/gonnect-netstack/helpers"
+	xicmp "golang.org/x/net/icmp"
+	xipv4 "golang.org/x/net/ipv4"
+	xipv6 "golang.org/x/net/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// PingConn represents a connection for sending and receiving ICMP ping packets.
+// PingConn sends ICMP Echo Request messages and reads Echo Reply payloads.
 type PingConn struct {
 	laddr    PingAddr
 	raddr    PingAddr
 	wq       waiter.Queue
 	ep       tcpip.Endpoint
 	deadline *time.Timer
+	seq      uint32
 }
 
 // PingAddr represents an ICMP ping address.
@@ -65,7 +70,7 @@ func (pc *PingConn) SetWriteDeadline(t time.Time) error {
 	return errors.New("not implemented")
 }
 
-// WriteTo writes data to the specified address through the ping connection.
+// WriteTo sends p as the payload of an ICMP Echo Request to addr.
 func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	var na netip.Addr
 	switch v := addr.(type) {
@@ -73,6 +78,7 @@ func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		na = v.Addr
 	case *net.IPAddr:
 		na, _ = netip.AddrFromSlice(v.IP)
+		na = na.Unmap()
 	default:
 		return 0, fmt.Errorf("ping write: wrong net.Addr type")
 	}
@@ -80,7 +86,12 @@ func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, fmt.Errorf("ping write: mismatched protocols")
 	}
 
-	buf := bytes.NewReader(p)
+	msg, err := pc.echoRequest(p, na)
+	if err != nil {
+		return 0, err
+	}
+
+	buf := bytes.NewReader(msg)
 	rfa, _ := helpers.ConvertToFullAddr(netip.AddrPortFrom(na, 0))
 	// won't block, no deadlines
 	n64, tcpipErr := pc.ep.Write(buf, tcpip.WriteOptions{
@@ -90,15 +101,46 @@ func (pc *PingConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return int(n64), fmt.Errorf("ping write: %s", tcpipErr)
 	}
 
-	return int(n64), nil
+	return len(p), nil
 }
 
-// Write writes data to the remote address of the ping connection.
+// Write sends p as the payload of an ICMP Echo Request to the remote address.
 func (pc *PingConn) Write(p []byte) (n int, err error) {
 	return pc.WriteTo(p, &pc.raddr)
 }
 
-// ReadFrom reads data from the ping connection and returns the remote address.
+func (pc *PingConn) echoRequest(p []byte, dst netip.Addr) ([]byte, error) {
+	typ := xicmp.Type(xipv4.ICMPTypeEcho)
+	if pc.laddr.Is6() {
+		typ = xipv6.ICMPTypeEchoRequest
+	}
+
+	msg := &xicmp.Message{
+		Type: typ,
+		Code: 0,
+		Body: &xicmp.Echo{
+			Seq:  int(atomic.AddUint32(&pc.seq, 1) & 0xffff),
+			Data: p,
+		},
+	}
+
+	var pseudoHeader []byte
+	if pc.laddr.Is6() {
+		src := pc.laddr.Addr
+		if !src.IsValid() || src.IsUnspecified() {
+			src = netip.IPv6Unspecified()
+		}
+		pseudoHeader = xicmp.IPv6PseudoHeader(net.IP(src.AsSlice()), net.IP(dst.AsSlice()))
+	}
+
+	msgBytes, err := msg.Marshal(pseudoHeader)
+	if err != nil {
+		return nil, fmt.Errorf("ping write: marshal: %w", err)
+	}
+	return msgBytes, nil
+}
+
+// ReadFrom reads an ICMP Echo Reply payload and returns the remote address.
 func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	e, notifyCh := waiter.NewChannelEntry(waiter.EventIn)
 	pc.wq.EventRegister(&e)
@@ -110,7 +152,8 @@ func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	case <-notifyCh:
 	}
 
-	w := tcpip.SliceWriter(p)
+	raw := make([]byte, len(p)+8)
+	w := tcpip.SliceWriter(raw)
 
 	res, tcpipErr := pc.ep.Read(&w, tcpip.ReadOptions{
 		NeedRemoteAddr: true,
@@ -120,10 +163,31 @@ func (pc *PingConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 
 	remoteAddr, _ := netip.AddrFromSlice(res.RemoteAddr.Addr.AsSlice())
-	return res.Count, &PingAddr{remoteAddr}, nil
+	payload, err := pc.echoPayload(raw[:res.Count])
+	if err != nil {
+		return 0, nil, err
+	}
+
+	return copy(p, payload), &PingAddr{remoteAddr}, nil
 }
 
-// Read reads data from the ping connection.
+func (pc *PingConn) echoPayload(raw []byte) ([]byte, error) {
+	proto := xipv4.ICMPTypeEchoReply.Protocol()
+	if pc.laddr.Is6() {
+		proto = xipv6.ICMPTypeEchoReply.Protocol()
+	}
+	msg, err := xicmp.ParseMessage(proto, raw)
+	if err != nil {
+		return nil, fmt.Errorf("ping read: parse: %w", err)
+	}
+	echo, ok := msg.Body.(*xicmp.Echo)
+	if !ok {
+		return nil, fmt.Errorf("ping read: unexpected ICMP body %T", msg.Body)
+	}
+	return echo.Data, nil
+}
+
+// Read reads an ICMP Echo Reply payload.
 func (pc *PingConn) Read(p []byte) (n int, err error) {
 	n, _, err = pc.ReadFrom(p)
 	return

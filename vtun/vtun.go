@@ -1024,8 +1024,8 @@ func (vt *VTun) ListenMulticastUDP(
 }
 
 // DialPingAddr creates an ICMP ping connection with the specified local and
-// remote addresses. This can be used to send and receive ICMP echo requests
-// and replies.
+// remote addresses. Writes send Echo Request messages. Reads return Echo Reply
+// payloads.
 func (vt *VTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 	if err := vt.checkUp(); err != nil {
 		return nil, err
@@ -1086,8 +1086,8 @@ func (vt *VTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 	return pc, nil
 }
 
-// ListenPingAddr creates an ICMP ping listener bound to the specified local address.
-// It can be used to receive ICMP echo requests and send replies.
+// ListenPingAddr creates an ICMP ping connection bound to the specified local
+// address.
 func (vt *VTun) ListenPingAddr(laddr netip.Addr) (*PingConn, error) {
 	return vt.DialPingAddr(laddr, netip.Addr{})
 }
@@ -1391,9 +1391,12 @@ func (vt *VTun) LookupNetIP(
 	}
 	addrs := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
 		addr, ok := netip.AddrFromSlice(ip)
 		if ok {
-			addrs = append(addrs, addr)
+			addrs = append(addrs, addr.Unmap())
 		}
 	}
 	return addrs, nil
