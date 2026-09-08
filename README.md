@@ -30,8 +30,45 @@ gonnect applications.
 - `DialTCP` / `ListenTCP` — TCP connection and listener management
 - `DialUDP` / `ListenUDP` — UDP socket support
 - `DialPingAddr` / `ListenPingAddr` — ICMP echo request/reply
-- Built-in ismple DNS resolution with configurable servers
+- Built-in simple DNS resolution with configurable servers
 - Wildcard address binding and automatic local address selection
+- Destination-based source address routing
+
+#### Source address routing
+
+Use `SourceRoutes` when one VTun has multiple local addresses and the remote
+destination must select the source address. The route with the longest matching
+prefix has priority.
+
+```go
+opts := vtun.Opts{
+	LocalAddrs: []netip.Addr{
+		netip.MustParseAddr("10.20.0.2"),
+		netip.MustParseAddr("100.64.0.2"),
+	},
+	SourceRoutes: []vtun.SourceRoute{
+		{
+			Destination: netip.MustParsePrefix("100.64.0.0/10"),
+			Source:      netip.MustParseAddr("100.64.0.2"),
+		},
+		{
+			Destination: netip.MustParsePrefix("0.0.0.0/0"),
+			Source:      netip.MustParseAddr("10.20.0.2"),
+		},
+	},
+}
+
+device, err := opts.Build()
+```
+
+The source address must be in `LocalAddrs`. Add an explicit `0.0.0.0/0` or
+`::/0` route if a configured family needs a fallback. If a family has source
+routes without a matching route, a new operation returns a network-unreachable
+error. A family without source routes keeps the legacy first-address behavior.
+
+Call `SetSourceRoutes` to replace the table while the VTun is running. New
+flows use the new table. Existing TCP, connected UDP, and connected ICMP flows
+keep the source address that they selected when they connected.
 
 ### spoofer
 
@@ -45,4 +82,3 @@ at the packet level.
 - TCP and UDP forwarders with configurable callbacks
 - Extensive TCP/IP tuning options
 - Works with TUN devices or arbitrary `io.ReadWriteCloser` endpoints
-

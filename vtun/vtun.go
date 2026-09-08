@@ -62,6 +62,10 @@ type Opts struct {
 	// LocalAddrs contains the local IP addresses to assign to the tunnel.
 	// If not provided, a random address from rarely used subnets will be generated.
 	LocalAddrs []netip.Addr
+	// SourceRoutes selects a local source address from the remote destination.
+	// Routes are independent for IPv4 and IPv6, and the longest prefix wins.
+	// A family with source routes has no implicit default route.
+	SourceRoutes []SourceRoute
 	// DnsServers contains the DNS servers to use for name resolution.
 	// Default: 8.8.8.8, 8.8.4.4, 1.1.1.1, 1.0.0.1, 9.9.9.9
 	DnsServers []netip.Addr
@@ -188,11 +192,15 @@ func (o *Opts) opts() *helpers.Opts {
 // Returns the initialized VTun instance or an error.
 func (o *Opts) Build() (*VTun, error) {
 	no := o.opts()
+	localAddrs := o.laddrs()
+	sourceRoutes, err := normalizeSourceRoutes(o.SourceRoutes, localAddrs)
+	if err != nil {
+		return nil, err
+	}
 	st, err := no.BuildStack(true)
 	if err != nil {
 		return nil, err
 	}
-	localAddrs := o.laddrs()
 	vt := &VTun{
 		ep:             channel.New(o.epch(), uint32(no.GetMTU()), ""),
 		stack:          st,
@@ -236,12 +244,13 @@ func (o *Opts) Build() (*VTun, error) {
 			vt.hasV6 = true
 		}
 	}
-	if vt.hasV4 {
-		vt.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: nid})
+	routeTable, err := sourceRouteTable(nid, vt.hasV4, vt.hasV6, sourceRoutes)
+	if err != nil {
+		return nil, err
 	}
-	if vt.hasV6 {
-		vt.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: nid})
-	}
+	vt.stack.SetRouteTable(routeTable)
+	vt.sourceRoutes.routes = sourceRoutes
+	vt.sourceRoutes.hasIPv4Route, vt.sourceRoutes.hasIPv6Route = sourceRouteFamilies(sourceRoutes)
 
 	vt.events <- tun.EventUp
 	return vt, nil
@@ -262,6 +271,7 @@ type VTun struct {
 	name           string
 	hasV4, hasV6   bool
 	localAddrs     []netip.Addr
+	sourceRoutes   sourceRouteState
 
 	lookupMu   sync.RWMutex
 	dnsServers []netip.Addr
@@ -532,13 +542,29 @@ func (vt *VTun) Close() error {
 	return nil
 }
 
-// DialTCPAddrPort establishes a TCP connection to the specified address and port.
-// The connection is created through the VTun's network stack.
+// DialTCPAddrPort establishes a TCP connection to the specified address and
+// port. When a source policy is active, the destination selects the local
+// address.
 func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gonet.TCPConn, error) {
+	return vt.dialTCPAddrPort(ctx, netip.AddrPort{}, addr)
+}
+
+func (vt *VTun) dialTCPAddrPort(
+	ctx context.Context,
+	laddr, raddr netip.AddrPort,
+) (*gonet.TCPConn, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
 	if err := vt.checkUp(); err != nil {
 		return nil, err
 	}
-	fa, pn := helpers.ConvertToFullAddr(addr)
+	if err := vt.validateExplicitLocalAddr(laddr.Addr(), raddr.Addr()); err != nil {
+		return nil, fmt.Errorf("tcp bind: %w", err)
+	}
+	fa, pn := helpers.ConvertToFullAddr(raddr)
 
 	var wq waiter.Queue
 	ep, tcpipErr := vt.stack.NewEndpoint(tcp.ProtocolNumber, pn, &wq)
@@ -546,19 +572,34 @@ func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gone
 		return nil, fmt.Errorf("tcp endpoint: %s", tcpipErr)
 	}
 
-	// Bind to a non-loopback address to prevent martian packet errors
-	localAddr := vt.dialAddr(addr.Addr().Is6())
-	bindFA := tcpip.FullAddress{
-		Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
-		Port: 0,
-		NIC:  vt.nid,
+	vt.sourceRoutes.RLock()
+	defer vt.sourceRoutes.RUnlock()
+
+	bindFA := tcpip.FullAddress{NIC: vt.nid, Port: laddr.Port()}
+	explicitLocal := laddr.Addr().IsValid() && !laddr.Addr().IsUnspecified()
+	if explicitLocal {
+		bindFA.Addr = tcpip.AddrFromSlice(laddr.Addr().AsSlice())
+	} else if !vt.hasSourcePolicyLocked(raddr.Addr().Is6()) {
+		// Preserve the legacy first-address selection when this family does not
+		// have a source policy.
+		localAddr := vt.dialAddr(raddr.Addr().Is6())
+		bindFA.Addr = tcpip.AddrFromSlice(localAddr.AsSlice())
+	} else if raddr.Addr().Is6() {
+		// The current gVisor IPv6 selector does not use Route.SourceHint. Bind
+		// the source from the same longest-prefix policy as a compatibility
+		// measure until gVisor supports IPv6 source hints.
+		if source, ok := vt.sourceForDestinationLocked(raddr.Addr()); ok {
+			bindFA.Addr = tcpip.AddrFromSlice(source.AsSlice())
+		}
 	}
-	if tcpipErr = ep.Bind(bindFA); tcpipErr != nil {
-		ep.Close()
-		return nil, fmt.Errorf("tcp bind: %s", tcpipErr)
+	if bindFA.Addr.BitLen() != 0 || laddr.Port() != 0 {
+		if tcpipErr = ep.Bind(bindFA); tcpipErr != nil {
+			ep.Close()
+			return nil, fmt.Errorf("tcp bind: %s", tcpipErr)
+		}
 	}
 
-	// Connect to remote address
+	// Connect performs route selection and fixes the source for this flow.
 	tcpipErr = ep.Connect(fa)
 	if tcpipErr != nil {
 		// ErrConnectStarted is expected for non-blocking TCP connect
@@ -573,18 +614,25 @@ func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gone
 
 func (vt *VTun) dialTCP(
 	ctx context.Context,
-	network, raddr string,
+	network, laddr, raddr string,
 ) (gonnect.TCPConn, error) {
+	lap := netip.AddrPort{}
 	var err error
-	addr := netip.AddrPort{}
+	if laddr != "" {
+		lap, err = parseOptionalAddrPort(laddr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rap := netip.AddrPort{}
 	if raddr != "" {
-		addr, err = netip.ParseAddrPort(raddr)
+		rap, err = netip.ParseAddrPort(raddr)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	conn, err := vt.DialTCPAddrPort(ctx, addr)
+	conn, err := vt.dialTCPAddrPort(ctx, lap, rap)
 	if err != nil {
 		return nil, err
 	}
@@ -592,7 +640,7 @@ func (vt *VTun) dialTCP(
 	// Wrap with helpers.TCPConn first
 	wrapped := &helpers.TCPConn{
 		TCPConn: conn,
-		Laddr:   fallbackConnAddr(network, ""),
+		Laddr:   fallbackConnAddr(network, laddr),
 		Raddr:   fallbackConnAddr(network, raddr),
 	}
 
@@ -609,8 +657,8 @@ func (vt *VTun) dialTCP(
 	return callbackWrapped.(gonnect.TCPConn), nil
 }
 
-// DialTCPAddrPort establishes a TCP connection to the specified address and port.
-// Laddr is always ignored.
+// DialTCP establishes a TCP connection. A specific laddr overrides the source
+// route selected for the remote destination.
 func (vt *VTun) DialTCP(
 	ctx context.Context,
 	network, laddr, raddr string,
@@ -619,9 +667,9 @@ func (vt *VTun) DialTCP(
 		return nil, net.UnknownNetworkError(network)
 	}
 	err = vt.runWithLookup(
-		ctx, network, "", raddr, gonnect.ConnRefused(network, raddr),
+		ctx, network, laddr, raddr, gonnect.ConnRefused(network, raddr),
 		func(laddr, raddr string) (bool, error) {
-			conn, err = vt.dialTCP(ctx, network, raddr)
+			conn, err = vt.dialTCP(ctx, network, laddr, raddr)
 			if err != nil {
 				return false, err
 			}
@@ -733,32 +781,52 @@ func (vt *VTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (*gonet.UDPConn, er
 	if err := vt.checkUp(); err != nil {
 		return nil, err
 	}
+	if err := vt.validateExplicitLocalAddr(laddr.Addr(), raddr.Addr()); err != nil {
+		return nil, fmt.Errorf("udp bind: %w", err)
+	}
 	var lfa, rfa *tcpip.FullAddress
-	var pn tcpip.NetworkProtocolNumber
+	pn := ipv4.ProtocolNumber
+	if raddr.Addr().Is6() || !raddr.Addr().IsValid() && laddr.Addr().Is6() {
+		pn = ipv6.ProtocolNumber
+	}
 
-	// If no local address specified, use non-loopback address to prevent martian packets
-	if laddr.IsValid() || laddr.Port() > 0 {
-		var addr tcpip.FullAddress
-		addr, pn = helpers.ConvertToFullAddr(laddr)
-		lfa = &addr
-	} else {
-		// Auto-select a non-loopback address
-		isV6 := raddr.Addr().Is6()
-		localAddr := vt.dialAddr(isV6)
-		pn = ipv4.ProtocolNumber
-		if isV6 {
-			pn = ipv6.ProtocolNumber
+	// A specific local address always has priority over a source route. A
+	// wildcard address can reserve a local port without preventing route-based
+	// source selection.
+	explicitLocal := laddr.Addr().IsValid() && !laddr.Addr().IsUnspecified()
+	if explicitLocal || laddr.Port() > 0 {
+		addr := tcpip.FullAddress{NIC: vt.nid, Port: laddr.Port()}
+		if explicitLocal {
+			addr.Addr = tcpip.AddrFromSlice(laddr.Addr().AsSlice())
 		}
-		lfa = &tcpip.FullAddress{
-			Addr: tcpip.AddrFromSlice(localAddr.AsSlice()),
-			Port: 0,
-			NIC:  vt.nid,
+		lfa = &addr
+	}
+
+	vt.sourceRoutes.RLock()
+	defer vt.sourceRoutes.RUnlock()
+	if !explicitLocal && !vt.hasSourcePolicyLocked(pn == ipv6.ProtocolNumber) {
+		// Preserve the legacy first-address selection when this family does not
+		// have a source policy.
+		localAddr := vt.dialAddr(pn == ipv6.ProtocolNumber)
+		if lfa == nil {
+			lfa = &tcpip.FullAddress{NIC: vt.nid}
+		}
+		lfa.Addr = tcpip.AddrFromSlice(localAddr.AsSlice())
+	} else if !explicitLocal && pn == ipv6.ProtocolNumber {
+		// The current gVisor IPv6 selector does not use Route.SourceHint. Bind
+		// the source from the same longest-prefix policy as a compatibility
+		// measure until gVisor supports IPv6 source hints.
+		if source, ok := vt.sourceForDestinationLocked(raddr.Addr()); ok {
+			if lfa == nil {
+				lfa = &tcpip.FullAddress{NIC: vt.nid}
+			}
+			lfa.Addr = tcpip.AddrFromSlice(source.AsSlice())
 		}
 	}
 
 	if raddr.IsValid() || raddr.Port() > 0 {
 		var addr tcpip.FullAddress
-		addr, pn = helpers.ConvertToFullAddr(raddr)
+		addr, _ = helpers.ConvertToFullAddr(raddr)
 		rfa = &addr
 	}
 	return gonet.DialUDP(vt.stack, lfa, rfa, pn)
@@ -1033,7 +1101,11 @@ func (vt *VTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 	if !laddr.IsValid() && !raddr.IsValid() {
 		return nil, errors.New("ping dial: invalid address")
 	}
+	if err := vt.validateExplicitLocalAddr(laddr, raddr); err != nil {
+		return nil, fmt.Errorf("ping bind: %w", err)
+	}
 	v6 := laddr.Is6() || raddr.Is6()
+	explicitLocal := laddr.IsValid() && !laddr.IsUnspecified()
 	bind := laddr.IsValid()
 	if !bind {
 		if v6 {
@@ -1062,9 +1134,25 @@ func (vt *VTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 	}
 	pc.ep = ep
 
+	vt.sourceRoutes.RLock()
+	if !explicitLocal && raddr.IsValid() && v6 && vt.hasSourcePolicyLocked(true) {
+		// The current gVisor IPv6 selector does not use Route.SourceHint. Bind
+		// the source from the same longest-prefix policy as a compatibility
+		// measure until gVisor supports IPv6 source hints.
+		if source, ok := vt.sourceForDestinationLocked(raddr); ok {
+			laddr = source
+			pc.laddr = PingAddr{source}
+			bind = true
+		}
+	}
 	if bind {
-		fa, _ := helpers.ConvertToFullAddr(netip.AddrPortFrom(laddr, 0))
+		fa := tcpip.FullAddress{
+			NIC:  vt.nid,
+			Addr: tcpip.AddrFromSlice(laddr.AsSlice()),
+		}
 		if tcpipErr = pc.ep.Bind(fa); tcpipErr != nil {
+			vt.sourceRoutes.RUnlock()
+			pc.ep.Close()
 			return nil, fmt.Errorf("ping bind: %s", tcpipErr)
 		}
 	}
@@ -1073,9 +1161,25 @@ func (vt *VTun) DialPingAddr(laddr, raddr netip.Addr) (*PingConn, error) {
 		pc.raddr = PingAddr{raddr}
 		fa, _ := helpers.ConvertToFullAddr(netip.AddrPortFrom(raddr, 0))
 		if tcpipErr = pc.ep.Connect(fa); tcpipErr != nil {
+			vt.sourceRoutes.RUnlock()
+			pc.ep.Close()
 			return nil, fmt.Errorf("ping connect: %s", tcpipErr)
 		}
+		selected, tcpipErr := pc.ep.GetLocalAddress()
+		if tcpipErr != nil {
+			vt.sourceRoutes.RUnlock()
+			pc.ep.Close()
+			return nil, fmt.Errorf("ping local address: %s", tcpipErr)
+		}
+		selectedAddr, ok := netip.AddrFromSlice(selected.Addr.AsSlice())
+		if !ok {
+			vt.sourceRoutes.RUnlock()
+			pc.ep.Close()
+			return nil, errors.New("ping local address: invalid selected address")
+		}
+		pc.laddr = PingAddr{selectedAddr}
 	}
+	vt.sourceRoutes.RUnlock()
 
 	// Track this connection for cleanup on Down()
 	vt.mu.Lock()
@@ -1122,10 +1226,6 @@ func (vt *VTun) exchangeDNS(ctx context.Context, server netip.Addr, q dnsmessage
 		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
 	}
 
-	// Use a non-loopback source address to prevent "martian packet" errors
-	isV6 := server.Is6()
-	localAddr := vt.dialAddr(isV6)
-
 	for _, useUDP := range []bool{true, false} {
 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
 		defer cancel()
@@ -1134,7 +1234,7 @@ func (vt *VTun) exchangeDNS(ctx context.Context, server netip.Addr, q dnsmessage
 		// TODO: Close c on ctx cancellation
 		var err error
 		if useUDP {
-			c, err = vt.DialUDPAddrPort(netip.AddrPortFrom(localAddr, 0), netip.AddrPortFrom(server, 53))
+			c, err = vt.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(server, 53))
 		} else {
 			c, err = vt.DialTCPAddrPort(ctx, netip.AddrPortFrom(server, 53))
 		}
