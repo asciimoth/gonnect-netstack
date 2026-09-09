@@ -450,7 +450,35 @@ func (vt *VTun) File() *os.File {
 
 // MTU returns the maximum transmission unit of the device.
 func (vt *VTun) MTU() (int, error) {
+	vt.mu.RLock()
+	defer vt.mu.RUnlock()
 	return vt.mtu, nil
+}
+
+// SetMTU changes the netstack NIC MTU without replacing the VTun. It updates
+// the value reported by MTU and emits EventMTUUpdate after a material change.
+func (vt *VTun) SetMTU(mtu int) error {
+	if mtu <= 0 || uint64(mtu) > math.MaxUint32 {
+		return fmt.Errorf("invalid MTU %d", mtu)
+	}
+
+	vt.mu.Lock()
+	defer vt.mu.Unlock()
+	if vt.closed {
+		return os.ErrClosed
+	}
+	if vt.mtu == mtu {
+		return nil
+	}
+	if err := vt.stack.SetNICMTU(vt.nid, uint32(mtu)); err != nil {
+		return fmt.Errorf("set MTU: %s", err.String())
+	}
+	vt.mtu = mtu
+	select {
+	case vt.events <- tun.EventMTUUpdate:
+	default:
+	}
+	return nil
 }
 
 // BatchSize returns the preferred number of packets that can be read or written
@@ -467,18 +495,27 @@ func (vt *VTun) Events() <-chan tun.Event {
 // Read reads a single packet from the incomingPacket channel and writes it
 // to the first buffer. It returns 1 for one packet read and the size of the packet.
 func (vt *VTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	view, ok := <-vt.incomingPacket
-	if !ok {
-		return 0, os.ErrClosed
-	}
-	defer view.Release()
+	for {
+		view, ok := <-vt.incomingPacket
+		if !ok {
+			return 0, os.ErrClosed
+		}
+		vt.mu.RLock()
+		mtu := vt.mtu
+		vt.mu.RUnlock()
+		if view.Size() > mtu {
+			view.Release()
+			continue
+		}
 
-	n, err := view.Read(buf[0][offset:])
-	if err != nil {
-		return 0, err
+		n, err := view.Read(buf[0][offset:])
+		view.Release()
+		if err != nil {
+			return 0, err
+		}
+		sizes[0] = n
+		return 1, nil
 	}
-	sizes[0] = n
-	return 1, nil
 }
 
 // Write writes packets to the device endpoint. It determines the IP version
