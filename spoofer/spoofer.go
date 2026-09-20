@@ -1,14 +1,21 @@
 // Package spoofer provides a network stack spoofer built on top of gVisor's
-// netstack. It enables intercepting and forwarding TCP/UDP traffic from a
-// TUN device or arbitrary io.ReadWriteCloser, with support for address
-// spoofing, promiscuous mode, and extensive TCP tuning options.
+// netstack. It can intercept and forward TCP and UDP traffic from a TUN device
+// or an io.ReadWriteCloser.
+//
+// OnTCPConn is an eager compatibility API: the intercepted client handshake is
+// complete before the callback runs. PrepareTCP is the connection-gated API:
+// it lets a forward proxy connect its upstream before Spoofer accepts the
+// client connection.
 package spoofer
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/asciimoth/gonnect"
@@ -26,13 +33,77 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+const defaultTCPPrepareTimeout = 30 * time.Second
+
+// PreparedTCPHandler owns an upstream resource that is ready for use. Spoofer
+// calls HandleTCP only after it completes the intercepted client handshake.
+// Ownership passes to HandleTCP at that point. Spoofer calls Close instead if
+// it cannot create the client endpoint.
+type PreparedTCPHandler interface {
+	HandleTCP(net.Conn)
+	Close() error
+}
+
+// PreparedTCPHandlerFuncs adapts functions to PreparedTCPHandler.
+type PreparedTCPHandlerFuncs struct {
+	HandleFunc func(net.Conn)
+	CloseFunc  func() error
+}
+
+// HandleTCP calls HandleFunc when it is not nil.
+func (h PreparedTCPHandlerFuncs) HandleTCP(conn net.Conn) {
+	if h.HandleFunc != nil {
+		h.HandleFunc(conn)
+	}
+}
+
+// Close calls CloseFunc when it is not nil.
+func (h PreparedTCPHandlerFuncs) Close() error {
+	if h.CloseFunc == nil {
+		return nil
+	}
+	return h.CloseFunc()
+}
+
+type cancelOnCloseEndpoint struct {
+	stack.LinkEndpoint
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+type tcpForwarderRequest interface {
+	ID() stack.TransportEndpointID
+	CreateEndpoint(*waiter.Queue) (tcpip.Endpoint, tcpip.Error)
+	Complete(bool)
+}
+
+func (e *cancelOnCloseEndpoint) Close() {
+	e.once.Do(e.cancel)
+	e.LinkEndpoint.Close()
+}
+
 // Opts holds configuration options for the spoofer.
 // It controls network stack behavior, TCP/UDP forwarding, and endpoint setup.
 type Opts struct {
-	// OnTCPConn is called when a new TCP connection is forwarded.
-	// The callback receives the connection and the transport endpoint ID
-	// containing local/remote addresses and ports.
+	// OnTCPConn is the eager, compatibility TCP callback. Spoofer completes the
+	// intercepted client handshake before it calls this function. A failure to
+	// connect the real upstream can therefore not make the original Dial fail.
+	// Forward proxies that need correct connection results must use PrepareTCP.
 	OnTCPConn func(net.Conn, stack.TransportEndpointID)
+	// PrepareTCP prepares the real upstream before Spoofer accepts an
+	// intercepted TCP connection. If preparation fails, Spoofer resets the
+	// client flow and calls OnTCPError. If it succeeds, Spoofer completes the
+	// client handshake and passes the connection to the prepared handler.
+	// PrepareTCP takes priority when both TCP callbacks are set.
+	PrepareTCP func(context.Context, stack.TransportEndpointID) (PreparedTCPHandler, error)
+	// OnTCPError reports preparation and client-endpoint errors from the
+	// connection-gated PrepareTCP path. Spoofer calls it from a forwarding
+	// goroutine. The callback must be safe for concurrent use.
+	OnTCPError func(stack.TransportEndpointID, error)
+	// TCPPrepareTimeout limits each PrepareTCP call. The default is 30 seconds.
+	// Values less than or equal to zero use the default. PrepareTCP must stop
+	// work and release partial resources when its context is done.
+	TCPPrepareTimeout time.Duration
 	// OnUDPConn is called when a new UDP stream is forwarded.
 	// The callback receives a packet connection and the transport endpoint ID.
 	OnUDPConn func(gonnect.PacketConn, stack.TransportEndpointID)
@@ -113,17 +184,41 @@ func (o *Opts) opts() *helpers.Opts {
 // Launch initializes and starts the network stack with the configured options.
 // It creates a NIC, sets up TCP and UDP forwarders, enables promiscuous mode
 // and spoofing, and configures routing for IPv4 and IPv6.
+//
+// PrepareTCP calls always have their individual timeout. Use LaunchContext
+// when shutdown must also cancel pending preparation calls.
 // Returns the initialized stack or an error if setup fails.
 func (o *Opts) Launch() (*stack.Stack, error) {
+	return o.LaunchContext(context.Background())
+}
+
+// LaunchContext is like Launch, and it also uses ctx as the Spoofer lifetime.
+// Cancel ctx before stack shutdown to stop all pending PrepareTCP calls.
+// Removing the Spoofer NIC also cancels these calls.
+func (o *Opts) LaunchContext(ctx context.Context) (*stack.Stack, error) {
+	if o == nil {
+		return nil, errors.New("spoofer: nil options")
+	}
+	if ctx == nil {
+		return nil, errors.New("spoofer: nil launch context")
+	}
+	lifetimeCtx, cancelLifetime := context.WithCancel(ctx)
+	if o.Endpoint == nil {
+		cancelLifetime()
+		return nil, errors.New("spoofer: link endpoint is nil")
+	}
+
 	no := o.opts()
 	st, err := no.BuildStack(false)
 	if err != nil {
+		cancelLifetime()
 		return nil, err
 	}
 
 	nicID := st.NextNICID()
 
 	if err := o.setupTCPOptions(st); err != nil {
+		cancelLifetime()
 		return nil, err
 	}
 
@@ -133,15 +228,11 @@ func (o *Opts) Launch() (*stack.Stack, error) {
 	}
 	tcpForwarder := tcp.NewForwarder(
 		st, o.TCPForwardWnd, TCPForwardAttempts, func(r *tcp.ForwarderRequest) {
-			var queue waiter.Queue
-			endpoint, err := r.CreateEndpoint(&queue)
-			if err != nil {
-				r.Complete(true) // With reset
+			if o.PrepareTCP != nil {
+				o.handlePreparedTCP(lifetimeCtx, r)
 				return
 			}
-			defer r.Complete(false) // Without reset
-			o.setTCPSocketOptions(endpoint)
-			o.OnTCPConn(gonet.NewTCPConn(&queue, endpoint), r.ID())
+			o.handleEagerTCP(r)
 		})
 	st.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
 
@@ -156,15 +247,19 @@ func (o *Opts) Launch() (*stack.Stack, error) {
 	})
 	st.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 
-	if err := st.CreateNIC(nicID, o.Endpoint); err != nil {
+	endpoint := &cancelOnCloseEndpoint{LinkEndpoint: o.Endpoint, cancel: cancelLifetime}
+	if err := st.CreateNIC(nicID, endpoint); err != nil {
+		cancelLifetime()
 		return nil, fmt.Errorf("create NIC: %s", err)
 	}
 
 	if err := st.SetPromiscuousMode(nicID, true); err != nil {
+		cancelLifetime()
 		return nil, fmt.Errorf("set promiscuous mode: %s", err)
 	}
 
 	if err := st.SetSpoofing(nicID, true); err != nil {
+		cancelLifetime()
 		return nil, fmt.Errorf("set spoofing: %s", err)
 	}
 
@@ -180,6 +275,75 @@ func (o *Opts) Launch() (*stack.Stack, error) {
 	})
 
 	return st, nil
+}
+
+func (o *Opts) handleEagerTCP(r tcpForwarderRequest) {
+	id := r.ID()
+	if o.OnTCPConn == nil {
+		r.Complete(true)
+		o.reportTCPError(id, errors.New("spoofer: no TCP forwarding callback is configured"))
+		return
+	}
+
+	var queue waiter.Queue
+	endpoint, err := r.CreateEndpoint(&queue)
+	if err != nil {
+		r.Complete(true)
+		o.reportTCPError(id, fmt.Errorf("create intercepted TCP endpoint: %s", err))
+		return
+	}
+	r.Complete(false)
+	o.setTCPSocketOptions(endpoint)
+	o.OnTCPConn(gonet.NewTCPConn(&queue, endpoint), id)
+}
+
+func (o *Opts) handlePreparedTCP(parent context.Context, r tcpForwarderRequest) {
+	id := r.ID()
+	timeout := o.TCPPrepareTimeout
+	if timeout <= 0 {
+		timeout = defaultTCPPrepareTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	prepared, err := o.PrepareTCP(ctx, id)
+	if err == nil {
+		err = ctx.Err()
+	}
+	cancel()
+	if err == nil && prepared == nil {
+		err = errors.New("PrepareTCP returned a nil handler")
+	}
+	if err != nil {
+		if prepared != nil {
+			if closeErr := prepared.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close prepared TCP handler: %w", closeErr))
+			}
+		}
+		r.Complete(true)
+		o.reportTCPError(id, fmt.Errorf("prepare TCP upstream: %w", err))
+		return
+	}
+
+	var queue waiter.Queue
+	endpoint, endpointErr := r.CreateEndpoint(&queue)
+	if endpointErr != nil {
+		err := fmt.Errorf("create intercepted TCP endpoint: %s", endpointErr)
+		if closeErr := prepared.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close prepared TCP handler: %w", closeErr))
+		}
+		r.Complete(true)
+		o.reportTCPError(id, err)
+		return
+	}
+
+	r.Complete(false)
+	o.setTCPSocketOptions(endpoint)
+	prepared.HandleTCP(gonet.NewTCPConn(&queue, endpoint))
+}
+
+func (o *Opts) reportTCPError(id stack.TransportEndpointID, err error) {
+	if o.OnTCPError != nil {
+		o.OnTCPError(id, err)
+	}
 }
 
 func (o *Opts) setupTCPOptions(s *stack.Stack) error {

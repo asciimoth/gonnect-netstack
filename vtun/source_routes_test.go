@@ -3,6 +3,7 @@ package vtun_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -275,17 +276,25 @@ func TestSourceRoutesExplicitLocalAddressOverridesPolicy(t *testing.T) {
 	assertPacketSource(t, device, udpDestination, explicitSource, ipProtocolUDP)
 
 	tcpDestination := netip.MustParseAddr("192.0.2.11")
-	conn, err := device.DialTCP(
-		context.Background(),
-		"tcp4",
-		netip.AddrPortFrom(explicitSource, 0).String(),
-		netip.AddrPortFrom(tcpDestination, 42001).String(),
-	)
-	if err != nil {
-		t.Fatalf("DialTCP() failed: %v", err)
-	}
-	defer closeTestResource(t, conn)
+	ctx, cancel := context.WithCancel(context.Background())
+	dialResult := make(chan error, 1)
+	go func() {
+		conn, err := device.DialTCP(
+			ctx,
+			"tcp4",
+			netip.AddrPortFrom(explicitSource, 0).String(),
+			netip.AddrPortFrom(tcpDestination, 42001).String(),
+		)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		dialResult <- err
+	}()
 	assertPacketSource(t, device, tcpDestination, explicitSource, ipProtocolTCP)
+	cancel()
+	if err := <-dialResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("DialTCP() error = %v, want context.Canceled", err)
+	}
 
 	pingDestination := netip.MustParseAddr("192.0.2.12")
 	ping, err := device.DialPingAddr(explicitSource, pingDestination)

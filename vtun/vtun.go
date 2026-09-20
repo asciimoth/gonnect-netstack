@@ -1,7 +1,8 @@
-// Package vtun provides a virtual tunnel implementation built on gVisor's netstack.
-// It creates userspace network interfaces that support TCP, UDP, and ICMP protocols,
-// with built-in DNS resolution capabilities. VTun implements multiple gonnect
-// interfaces including Network, Resolver, InterfaceNetwork, UpDown, and tun.Tun.
+// Package vtun provides a virtual tunnel implementation built on gVisor's
+// netstack. It creates userspace network interfaces that support TCP, UDP, and
+// ICMP, with built-in DNS resolution. TCP name dials use a dual-stack
+// connection race so an unavailable address family does not block a usable
+// address from the other family.
 package vtun
 
 import (
@@ -72,6 +73,11 @@ type Opts struct {
 	// Lookup provides a custom DNS lookup function.
 	// If not set, uses the built-in simple DNS resolver.
 	Lookup gonnect.LookupIP
+	// TCPFallbackDelay is the time that Dial and DialTCP wait before they
+	// start the next resolved TCP candidate. The default is 250 ms. A negative
+	// value disables timed fallback, but a definitive failure still starts the
+	// next candidate immediately.
+	TCPFallbackDelay time.Duration
 
 	// Name specifies the name of the tunnel interface. Default: "vtun".
 	Name string
@@ -126,6 +132,13 @@ func (o *Opts) lookup() gonnect.LookupIP {
 		return o.Lookup
 	}
 	return nil
+}
+
+func (o *Opts) tcpFallbackDelay() time.Duration {
+	if o != nil && o.TCPFallbackDelay != 0 {
+		return o.TCPFallbackDelay
+	}
+	return 250 * time.Millisecond
 }
 
 func (o *Opts) laddrs() []netip.Addr {
@@ -202,17 +215,18 @@ func (o *Opts) Build() (*VTun, error) {
 		return nil, err
 	}
 	vt := &VTun{
-		ep:             channel.New(o.epch(), uint32(no.GetMTU()), ""),
-		stack:          st,
-		events:         make(chan tun.Event, o.evch()),
-		incomingPacket: make(chan *buffer.View, 256), // Buffered to prevent blocking WriteNotify
-		dnsServers:     o.dns(),
-		mtu:            no.GetMTU(),
-		name:           o.name(),
-		lookup:         o.lookup(),
-		localAddrs:     localAddrs,
-		mwo:            o.mwo(),
-		mro:            o.mro(),
+		ep:               channel.New(o.epch(), uint32(no.GetMTU()), ""),
+		stack:            st,
+		events:           make(chan tun.Event, o.evch()),
+		incomingPacket:   make(chan *buffer.View, 256), // Buffered to prevent blocking WriteNotify
+		dnsServers:       o.dns(),
+		mtu:              no.GetMTU(),
+		name:             o.name(),
+		lookup:           o.lookup(),
+		tcpFallbackDelay: o.tcpFallbackDelay(),
+		localAddrs:       localAddrs,
+		mwo:              o.mwo(),
+		mro:              o.mro(),
 	}
 	vt.notifyHandle = vt.ep.AddNotify(vt)
 	nid, err := helpers.CreateNIC(st, nil, vt.ep)
@@ -273,9 +287,10 @@ type VTun struct {
 	localAddrs     []netip.Addr
 	sourceRoutes   sourceRouteState
 
-	lookupMu   sync.RWMutex
-	dnsServers []netip.Addr
-	lookup     gonnect.LookupIP
+	lookupMu         sync.RWMutex
+	dnsServers       []netip.Addr
+	lookup           gonnect.LookupIP
+	tcpFallbackDelay time.Duration
 
 	mu      sync.RWMutex
 	closed  bool
@@ -579,9 +594,10 @@ func (vt *VTun) Close() error {
 	return nil
 }
 
-// DialTCPAddrPort establishes a TCP connection to the specified address and
-// port. When a source policy is active, the destination selects the local
-// address.
+// DialTCPAddrPort starts a TCP connection to a numeric address. This low-level
+// method returns the endpoint after gVisor starts the connect operation. Use
+// DialTCP when success must mean that the TCP handshake is complete. When a
+// source policy is active, the destination selects the local address.
 func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gonet.TCPConn, error) {
 	return vt.dialTCPAddrPort(ctx, netip.AddrPort{}, addr)
 }
@@ -589,6 +605,24 @@ func (vt *VTun) DialTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gone
 func (vt *VTun) dialTCPAddrPort(
 	ctx context.Context,
 	laddr, raddr netip.AddrPort,
+) (*gonet.TCPConn, error) {
+	return vt.dialTCPAddrPortMode(ctx, laddr, raddr, false)
+}
+
+// dialConnectedTCPAddrPort does not return until the TCP handshake completes.
+// The resolved dial race uses this mode so a SYN that does not get a response
+// cannot incorrectly win over another candidate.
+func (vt *VTun) dialConnectedTCPAddrPort(
+	ctx context.Context,
+	laddr, raddr netip.AddrPort,
+) (*gonet.TCPConn, error) {
+	return vt.dialTCPAddrPortMode(ctx, laddr, raddr, true)
+}
+
+func (vt *VTun) dialTCPAddrPortMode(
+	ctx context.Context,
+	laddr, raddr netip.AddrPort,
+	waitForHandshake bool,
 ) (*gonet.TCPConn, error) {
 	select {
 	case <-ctx.Done():
@@ -608,9 +642,23 @@ func (vt *VTun) dialTCPAddrPort(
 	if tcpipErr != nil {
 		return nil, fmt.Errorf("tcp endpoint: %s", tcpipErr)
 	}
+	if laddr.Port() != 0 && waitForHandshake {
+		// Happy Eyeballs can have two sockets with the requested source port in
+		// flight. Each candidate has a different remote address, so sharing the
+		// bind is safe and keeps the caller's explicit port unchanged.
+		ep.SocketOptions().SetReuseAddress(true)
+		ep.SocketOptions().SetReusePort(true)
+	}
+
+	var waitEntry waiter.Entry
+	var notifyCh <-chan struct{}
+	if waitForHandshake {
+		waitEntry, notifyCh = waiter.NewChannelEntry(waiter.WritableEvents)
+		wq.EventRegister(&waitEntry)
+		defer wq.EventUnregister(&waitEntry)
+	}
 
 	vt.sourceRoutes.RLock()
-	defer vt.sourceRoutes.RUnlock()
 
 	bindFA := tcpip.FullAddress{NIC: vt.nid, Port: laddr.Port()}
 	explicitLocal := laddr.Addr().IsValid() && !laddr.Addr().IsUnspecified()
@@ -631,6 +679,7 @@ func (vt *VTun) dialTCPAddrPort(
 	}
 	if bindFA.Addr.BitLen() != 0 || laddr.Port() != 0 {
 		if tcpipErr = ep.Bind(bindFA); tcpipErr != nil {
+			vt.sourceRoutes.RUnlock()
 			ep.Close()
 			return nil, fmt.Errorf("tcp bind: %s", tcpipErr)
 		}
@@ -638,11 +687,32 @@ func (vt *VTun) dialTCPAddrPort(
 
 	// Connect performs route selection and fixes the source for this flow.
 	tcpipErr = ep.Connect(fa)
+	vt.sourceRoutes.RUnlock()
 	if tcpipErr != nil {
 		// ErrConnectStarted is expected for non-blocking TCP connect
 		if _, ok := tcpipErr.(*tcpip.ErrConnectStarted); !ok {
 			ep.Close()
 			return nil, fmt.Errorf("tcp connect: %s", tcpipErr)
+		}
+	}
+	if waitForHandshake {
+		if _, started := tcpipErr.(*tcpip.ErrConnectStarted); started {
+			select {
+			case <-ctx.Done():
+				ep.Close()
+				return nil, ctx.Err()
+			case <-notifyCh:
+			}
+			tcpipErr = ep.LastError()
+		}
+		if tcpipErr != nil {
+			ep.Close()
+			return nil, &net.OpError{
+				Op:   "connect",
+				Net:  "tcp",
+				Addr: &net.TCPAddr{IP: net.IP(raddr.Addr().AsSlice()), Port: int(raddr.Port()), Zone: raddr.Addr().Zone()},
+				Err:  errors.New(tcpipErr.String()),
+			}
 		}
 	}
 
@@ -669,7 +739,7 @@ func (vt *VTun) dialTCP(
 		}
 	}
 
-	conn, err := vt.dialTCPAddrPort(ctx, lap, rap)
+	conn, err := vt.dialConnectedTCPAddrPort(ctx, lap, rap)
 	if err != nil {
 		return nil, err
 	}
@@ -694,26 +764,24 @@ func (vt *VTun) dialTCP(
 	return callbackWrapped.(gonnect.TCPConn), nil
 }
 
-// DialTCP establishes a TCP connection. A specific laddr overrides the source
-// route selected for the remote destination.
+// DialTCP establishes a TCP connection. For a name with addresses from both
+// IP families, it races the resolved candidates and returns the first
+// connection that completes its TCP handshake. It starts the next candidate
+// after TCPFallbackDelay, or immediately after a definitive failure. The
+// caller context is the time limit for the complete race.
+//
+// The tcp4 and tcp6 networks use only the requested family. An IP literal is
+// dialed once without a DNS lookup. A specific laddr overrides the source
+// route selected for the remote destination and also restricts the race to
+// the local address family.
 func (vt *VTun) DialTCP(
 	ctx context.Context,
 	network, laddr, raddr string,
-) (conn gonnect.TCPConn, err error) {
+) (gonnect.TCPConn, error) {
 	if !gonnect.IsTCPNetwork(network) {
 		return nil, net.UnknownNetworkError(network)
 	}
-	err = vt.runWithLookup(
-		ctx, network, laddr, raddr, gonnect.ConnRefused(network, raddr),
-		func(laddr, raddr string) (bool, error) {
-			conn, err = vt.dialTCP(ctx, network, laddr, raddr)
-			if err != nil {
-				return false, err
-			}
-			return true, nil
-		},
-	)
-	return
+	return vt.dialResolvedTCP(ctx, network, laddr, raddr)
 }
 
 // ListenTCPAddrPort listens for incoming TCP connections on the specified address and port.
@@ -1070,6 +1138,8 @@ func fallbackListenerAddr(network, addr string) net.Addr {
 	}
 }
 
+// Dial connects to address through the VTun. TCP names use the same
+// dual-stack connection race as DialTCP. UDP behavior is unchanged.
 func (vt *VTun) Dial(
 	ctx context.Context,
 	network, address string,
@@ -1382,6 +1452,9 @@ func (vt *VTun) tryOneName(ctx context.Context, name string, qtype dnsmessage.Ty
 	return dnsmessage.Parser{}, "", lastErr
 }
 
+// runWithLookup resolves addresses for UDP and listen operations. Resolved TCP
+// dials use dialResolvedTCP because this sequential helper cannot recover from
+// a blackholed first candidate.
 func (vt *VTun) runWithLookup(
 	ctx context.Context, network, laddr, raddr string,
 	fail error,
@@ -1628,9 +1701,10 @@ func (vt *VTun) LookupTXT(
 	return nil, gonnect.DnsReqErr(name, "unsupported")
 }
 
-// LookupHost performs a DNS lookup for the given host name and returns a list
-// of IP addresses. It resolves both A and AAAA records in parallel if both
-// IPv4 and IPv6 are enabled on the VTun.
+// LookupHost performs a DNS lookup for host and returns the addresses that the
+// VTun protocol configuration supports. It resolves A and AAAA records in
+// parallel when both families are enabled. The result order is not a carrier
+// reachability decision. Dial and DialTCP schedule and race TCP candidates.
 func (vt *VTun) LookupHost(ctx context.Context, host string) ([]string, error) {
 	if host == "" {
 		return []string{""}, nil
@@ -1651,9 +1725,20 @@ func (vt *VTun) LookupHost(ctx context.Context, host string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		strs := []string{}
+		strs := make([]string, 0, len(ips))
 		for _, ip := range ips {
-			strs = append(strs, ip.String())
+			if ip.To4() != nil {
+				if vt.hasV4 {
+					strs = append(strs, ip.String())
+				}
+				continue
+			}
+			if ip.To16() != nil && vt.hasV6 {
+				strs = append(strs, ip.String())
+			}
+		}
+		if len(strs) == 0 {
+			return nil, &net.OpError{Op: "lookup", Net: "ip", Err: errNoSuitableAddress}
 		}
 		return strs, nil
 	}
