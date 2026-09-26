@@ -347,6 +347,17 @@ func (o *Opts) reportTCPError(id stack.TransportEndpointID, err error) {
 }
 
 func (o *Opts) setupTCPOptions(s *stack.Stack) error {
+	// A TCP forwarder is a protocol handler, not a listening endpoint. gVisor
+	// can redirect a valid replacement SYN from TIME_WAIT only to a listening
+	// endpoint. Keep no TIME_WAIT endpoints in this transparent, local stack so
+	// that a reused four-tuple reaches the forwarder. TCP sequence checks still
+	// prevent packets from an old connection from entering a new endpoint.
+	// See https://github.com/google/gvisor/issues/15013.
+	timeWait := tcpip.TCPTimeWaitTimeoutOption(0)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &timeWait); err != nil {
+		return fmt.Errorf("disable TCP TIME_WAIT: %s", err)
+	}
+
 	if o.TTL != 0 {
 		opt := tcpip.DefaultTTLOption(o.TTL)
 		if err := s.SetNetworkProtocolOption(ipv4.ProtocolNumber, &opt); err != nil {

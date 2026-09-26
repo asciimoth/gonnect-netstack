@@ -6,15 +6,45 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 type failingTCPForwarderRequest struct {
 	id            stack.TransportEndpointID
 	completeCalls []bool
+}
+
+func TestSetupTCPOptionsDisablesTimeWait(t *testing.T) {
+	opts := &Opts{}
+	st, err := opts.opts().BuildStack(false)
+	if err != nil {
+		t.Fatalf("build stack: %v", err)
+	}
+	defer st.Destroy()
+
+	var before tcpip.TCPTimeWaitTimeoutOption
+	if err := st.TransportProtocolOption(tcp.ProtocolNumber, &before); err != nil {
+		t.Fatalf("get initial TCP TIME_WAIT: %v", err)
+	}
+	if before == 0 {
+		t.Fatal("initial TCP TIME_WAIT is disabled; test cannot verify the change")
+	}
+	if err := opts.setupTCPOptions(st); err != nil {
+		t.Fatalf("set up TCP options: %v", err)
+	}
+
+	var after tcpip.TCPTimeWaitTimeoutOption
+	if err := st.TransportProtocolOption(tcp.ProtocolNumber, &after); err != nil {
+		t.Fatalf("get configured TCP TIME_WAIT: %v", err)
+	}
+	if after != 0 {
+		t.Fatalf("TCP TIME_WAIT = %v, want 0", time.Duration(after))
+	}
 }
 
 func (r *failingTCPForwarderRequest) ID() stack.TransportEndpointID {
