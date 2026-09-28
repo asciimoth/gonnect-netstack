@@ -2,6 +2,7 @@ package spoofer
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -12,6 +13,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
+
+// maxTunReadPacketSize is large enough for the maximum IP packet that the
+// wrapped netstack supports, excluding IPv6 jumbograms.
+const maxTunReadPacketSize = header.MaxIPPacketSize
 
 // ioEndpoint implements stack.LinkEndpoint from io.ReadWriteCloser.
 type ioEndpoint struct {
@@ -240,39 +245,69 @@ func (e *tunEndpoint) reader() {
 	}
 
 	for {
-		n, err := e.tun.Read(bufs, sizes, e.readOffset)
-		if err != nil {
-			break
+		select {
+		case <-e.ctx.Done():
+			return
+		default:
 		}
 
-		if !e.IsAttached() {
+		clear(sizes)
+		n, err := e.tun.Read(bufs, sizes, e.readOffset)
+		if e.IsAttached() {
+			e.deliverPackets(bufs, sizes, n)
+		}
+
+		if err == nil {
+			continue
+		}
+		if tun.IsTunTermError(err) {
+			break
+		}
+		if errors.Is(err, io.ErrShortBuffer) {
+			bufs = e.growReadBuffers(bufs, sizes)
+		}
+	}
+}
+
+func (e *tunEndpoint) deliverPackets(bufs [][]byte, sizes []int, n int) {
+	n = min(n, len(bufs), len(sizes))
+	for i := range n {
+		if sizes[i] <= 0 || sizes[i] > len(bufs[i])-e.readOffset {
 			continue
 		}
 
-		for i := range n {
-			if sizes[i] <= 0 {
-				continue
-			}
+		data := bufs[i][e.readOffset : e.readOffset+sizes[i]]
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithData(data),
+		})
 
-			end := e.readOffset + sizes[i]
-			if end > len(bufs[i]) {
-				continue
-			}
-			data := bufs[i][e.readOffset:end]
-
-			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.MakeWithData(data),
-			})
-
-			switch header.IPVersion(data) {
-			case header.IPv4Version:
-				e.InjectInbound(header.IPv4ProtocolNumber, pkt)
-			case header.IPv6Version:
-				e.InjectInbound(header.IPv6ProtocolNumber, pkt)
-			}
-			pkt.DecRef()
+		switch header.IPVersion(data) {
+		case header.IPv4Version:
+			e.InjectInbound(header.IPv4ProtocolNumber, pkt)
+		case header.IPv6Version:
+			e.InjectInbound(header.IPv6ProtocolNumber, pkt)
 		}
+		pkt.DecRef()
 	}
+}
+
+func (e *tunEndpoint) growReadBuffers(bufs [][]byte, sizes []int) [][]byte {
+	packetSize := len(bufs[0]) - e.readOffset
+	target := min(max(packetSize*2, 1), maxTunReadPacketSize)
+	if mtu, err := e.tun.MTU(); err == nil {
+		target = min(max(target, mtu), maxTunReadPacketSize)
+	}
+	for _, size := range sizes {
+		target = min(max(target, size), maxTunReadPacketSize)
+	}
+	if target <= packetSize {
+		return bufs
+	}
+
+	for i := range bufs {
+		bufs[i] = make([]byte, e.readOffset+target)
+	}
+	return bufs
 }
 
 func (e *tunEndpoint) writer() {
