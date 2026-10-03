@@ -510,6 +510,10 @@ func (vt *VTun) Events() <-chan tun.Event {
 // Read reads a single packet from the incomingPacket channel and writes it
 // to the first buffer. It returns 1 for one packet read and the size of the packet.
 func (vt *VTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
+	if len(buf) == 0 || len(sizes) == 0 || offset < 0 || offset > len(buf[0]) {
+		return 0, io.ErrShortBuffer
+	}
+
 	for {
 		view, ok := <-vt.incomingPacket
 		if !ok {
@@ -521,6 +525,11 @@ func (vt *VTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 		if view.Size() > mtu {
 			view.Release()
 			continue
+		}
+		if view.Size() > len(buf[0])-offset {
+			sizes[0] = view.Size()
+			view.Release()
+			return 0, io.ErrShortBuffer
 		}
 
 		n, err := view.Read(buf[0][offset:])
@@ -537,20 +546,28 @@ func (vt *VTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
 // from the first nibble of each packet and injects it as an inbound packet
 // to the appropriate protocol handler.
 func (vt *VTun) Write(buf [][]byte, offset int) (int, error) {
-	for _, buf := range buf {
-		packet := buf[offset:]
+	for i, packetBuffer := range buf {
+		if offset < 0 || offset > len(packetBuffer) {
+			return i, io.ErrShortBuffer
+		}
+		packet := packetBuffer[offset:]
 		if len(packet) == 0 {
 			continue
 		}
 
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
+		var err error
 		switch packet[0] >> 4 {
 		case 4:
 			vt.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
 		case 6:
 			vt.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
 		default:
-			return 0, syscall.EAFNOSUPPORT
+			err = syscall.EAFNOSUPPORT
+		}
+		pkb.DecRef()
+		if err != nil {
+			return i, err
 		}
 	}
 	return len(buf), nil

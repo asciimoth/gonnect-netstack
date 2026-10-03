@@ -96,29 +96,27 @@ func (e *ioEndpoint) reader() {
 		if err != nil {
 			break
 		}
-
-		if n == 0 {
-			// drop
-			continue
-		}
-
-		if !e.IsAttached() {
-			// drop
-			continue
-		}
-
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(data[:n]),
-		})
-
-		switch header.IPVersion(data) {
-		case header.IPv4Version:
-			e.InjectInbound(header.IPv4ProtocolNumber, pkt)
-		case header.IPv6Version:
-			e.InjectInbound(header.IPv6ProtocolNumber, pkt)
-		}
-		pkt.DecRef()
+		e.deliverPacket(data, n)
 	}
+}
+
+func (e *ioEndpoint) deliverPacket(data []byte, n int) {
+	if n <= 0 || n > len(data) || !e.IsAttached() {
+		return
+	}
+
+	data = data[:n]
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(data),
+	})
+
+	switch header.IPVersion(data) {
+	case header.IPv4Version:
+		e.InjectInbound(header.IPv4ProtocolNumber, pkt)
+	case header.IPv6Version:
+		e.InjectInbound(header.IPv6ProtocolNumber, pkt)
+	}
+	pkt.DecRef()
 }
 
 func (e *ioEndpoint) writer() {
